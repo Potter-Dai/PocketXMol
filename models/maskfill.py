@@ -76,13 +76,26 @@ class PMAsymDenoiser(Module):
         self.edgetype_embedder = nn.Embedding(num_edge_types, edge_dim-2)
         
         # Denoiser network: remove noise from molecule representations
+        self.enable_chiral_se3 = bool(getattr(config, 'enable_chiral_se3', False))
+        if self.enable_chiral_se3:
+            self.chiral_prompt_proj = nn.Sequential(
+                nn.Linear(2, 64),
+                nn.SiLU(),
+                nn.Linear(64, node_dim),
+            )
+            nn.init.zeros_(self.chiral_prompt_proj[-1].weight)
+            nn.init.zeros_(self.chiral_prompt_proj[-1].bias)
+
         denoiser_name = getattr(config.denoiser, 'name', 'default')
         if denoiser_name == 'default':
             denoiser_bb = ContextNodeEdgeNet if not gvp else ContextNodeEdgeNetGVP
         elif denoiser_name == 'ipa':
             denoiser_bb = ContextGAEdgeNet
+        denoiser_kwargs = dict(config.denoiser)
+        if self.enable_chiral_se3:
+            denoiser_kwargs.setdefault('enable_chiral_se3', True)
         self.denoiser = denoiser_bb(node_dim, edge_dim,
-                            context_dim=pocket_dim, **config.denoiser)
+                            context_dim=pocket_dim, **denoiser_kwargs)
 
         # Output decoders
         self.node_decoder = MLP(node_dim, num_node_types, node_dim)
@@ -148,19 +161,37 @@ class PMAsymDenoiser(Module):
         if 'is_peptide' in self.addition_node_features:
             is_peptide = batch['is_peptide'].unsqueeze(-1).to(pos_in.dtype)
             h_node_in = torch.cat([h_node_in, is_peptide], dim=-1)
+
+        if self.enable_chiral_se3:
+            chiral_prompt = batch.get('chiral_prompt', None)
+            if chiral_prompt is not None:
+                h_node_in = h_node_in + self.chiral_prompt_proj(
+                    chiral_prompt.to(dtype=h_node_in.dtype, device=h_node_in.device)
+                )
         
-        # Step 2: Encode protein pocket as context
-        h_pocket = self.pocket_embedder(batch['pocket_atom_feature'])
-        h_pocket = self.pocket_encoder(
-            h_node=h_pocket,
-            pos_node=batch['pocket_pos'],
-            edge_index=batch['pocket_knn_edge_index'],
-            h_edge=None,
-            node_extra=None,
-            edge_extra=None,
-        )
+        # Step 2: Encode protein pocket as context (guard empty pocket)
+        pocket_pos = batch.get('pocket_pos', None)
+        if pocket_pos is not None and pocket_pos.shape[0] > 0:
+            h_pocket = self.pocket_embedder(batch['pocket_atom_feature'])
+            h_pocket = self.pocket_encoder(
+                h_node=h_pocket,
+                pos_node=pocket_pos,
+                edge_index=batch['pocket_knn_edge_index'],
+                h_edge=None,
+                node_extra=None,
+                edge_extra=None,
+            )
+            pos_ctx = pocket_pos
+            batch_ctx = batch['pocket_pos_batch']
+        else:
+            h_pocket = None
+            pos_ctx = None
+            batch_ctx = None
 
         # Step 3: Denoise molecule conditioned on pocket
+        denoiser_extra = {}
+        if self.enable_chiral_se3:
+            denoiser_extra['ca_anchor_triples'] = batch.get('ca_anchor_triples', None)
         h_node, pos_node, h_edge = self.denoiser(
             h_node=h_node_in,
             pos_node=pos_in, 
@@ -171,8 +202,9 @@ class PMAsymDenoiser(Module):
             batch_node=batch['node_type_batch'],
             # Pocket context
             h_ctx=h_pocket,
-            pos_ctx=batch['pocket_pos'],
-            batch_ctx=batch['pocket_pos_batch'],
+            pos_ctx=pos_ctx,
+            batch_ctx=batch_ctx,
+            **denoiser_extra,
         )
         
         # Step 4: Decode predictions

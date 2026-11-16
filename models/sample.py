@@ -20,6 +20,8 @@ import torch
 from torch.nn import functional as F
 from tqdm import tqdm
 
+from models.corrector import correct_macrocycle_geometry
+
 ALT_KEYS = {'node': 'node_type', 'pos': 'node_pos', 'halfedge': 'halfedge_type'}
 
 
@@ -51,7 +53,7 @@ def add_info_to_dict(data_dict, data, mode):
         data_dict[key].append(this.detach().cpu())
 
 
-def sample_loop3(batch, model, noiser, device=None, is_ar='', off_tqdm=False):
+def sample_loop3(batch, model, noiser, device=None, is_ar='', off_tqdm=False, correct_macrocycle=False):
     """
     Main sampling loop for reverse diffusion process.
     
@@ -118,6 +120,19 @@ def sample_loop3(batch, model, noiser, device=None, is_ar='', off_tqdm=False):
             step_ar += 1
         else:
             break
+
+    if correct_macrocycle:
+        corr_pos = correct_macrocycle_geometry(
+            batch,
+            pos=batch['node_pos'],
+            config=correct_macrocycle if isinstance(correct_macrocycle, dict) else None,
+        )
+        batch['node_pos'] = corr_pos
+        outputs['pred_pos'] = corr_pos
+        if len(out_dict['pos']) > 0:
+            out_dict['pos'][-1] = corr_pos.detach().cpu()
+        if len(traj_dict['pos']) > 0:
+            traj_dict['pos'][-1] = corr_pos.detach().cpu()
     
     # Stack trajectories into arrays
     all_trajs, in_trajs, out_trajs = {}, {}, {}

@@ -161,6 +161,114 @@ class IndividualTasksLoss(nn.Module):
             })
 
         return loss_dih_tasked
+
+    @staticmethod
+    def _safe_unit(vec, eps=1e-4):
+        norm = torch.sqrt((vec * vec).sum(dim=-1, keepdim=True) + eps * eps)
+        return vec / norm
+
+    @classmethod
+    def _safe_dihedral_sin_cos(cls, p0, p1, p2, p3, eps=1e-4):
+        b0 = p0 - p1
+        b1 = cls._safe_unit(p1 - p2, eps=eps)
+        b2 = p3 - p2
+        v = b0 - (b0 * b1).sum(dim=-1, keepdim=True) * b1
+        w = b2 - (b2 * b1).sum(dim=-1, keepdim=True) * b1
+        v = cls._safe_unit(v, eps=eps)
+        w = cls._safe_unit(w, eps=eps)
+        cos = (v * w).sum(dim=-1, keepdim=True)
+        sin = (torch.linalg.cross(w, v, dim=-1) * b1).sum(dim=-1, keepdim=True)
+        return sin, cos
+
+    def chiral_loss(self, node_pos, pred_pos, batch, task_batch_dict=None):
+        """Float32 signed-volume smooth L1 + hinge chirality loss on `ca_chiral_quads`."""
+        quads = batch.get('ca_chiral_quads', None)
+        if quads is None or quads.shape[0] == 0:
+            tasks = ['mixed'] + (list(task_batch_dict.keys()) if task_batch_dict else [])
+            return {f'{t}/chiral': node_pos.new_tensor(0.0, dtype=torch.float32) for t in tasks}
+
+        p_gt = node_pos.float()
+        p_pr = pred_pos.float()
+        ca, n, c, cb = quads[:, 0], quads[:, 1], quads[:, 2], quads[:, 3]
+
+        unfixed_quad = (batch['fixed_pos'][quads] == 0).any(dim=-1)
+        u_gt = self._safe_unit(p_gt[n] - p_gt[ca])
+        v_gt = self._safe_unit(p_gt[c] - p_gt[ca])
+        w_gt = self._safe_unit(p_gt[cb] - p_gt[ca])
+        vol_gt = (torch.linalg.cross(u_gt, v_gt, dim=-1) * w_gt).sum(dim=-1)
+
+        u_pr = self._safe_unit(p_pr[n] - p_pr[ca])
+        v_pr = self._safe_unit(p_pr[c] - p_pr[ca])
+        w_pr = self._safe_unit(p_pr[cb] - p_pr[ca])
+        vol_pr = (torch.linalg.cross(u_pr, v_pr, dim=-1) * w_pr).sum(dim=-1)
+
+        valid = unfixed_quad & (vol_gt.abs() > 1e-2)
+        per_quad = F.smooth_l1_loss(vol_pr, vol_gt, reduction='none', beta=0.2) + F.relu(
+            0.25 - torch.sign(vol_gt) * vol_pr
+        )
+
+        if task_batch_dict is None:
+            return {'mixed/chiral': self._selected_mean_loss(per_quad, valid)}
+
+        batch_quad = batch['node_type_batch'].index_select(0, ca)
+        out = {'mixed/chiral': self._selected_mean_loss(per_quad, valid)}
+        for task, b_mask in task_batch_dict.items():
+            sel = valid & b_mask.index_select(0, batch_quad)
+            out[f'{task}/chiral'] = self._selected_mean_loss(per_quad, sel)
+        return out
+
+    def omega_loss(self, node_pos, pred_pos, batch, task_batch_dict=None):
+        """Float32 peptide omega dihedral loss on `amide_omega_quads`."""
+        quads = batch.get('amide_omega_quads', None)
+        if quads is None or quads.shape[0] == 0:
+            tasks = ['mixed'] + (list(task_batch_dict.keys()) if task_batch_dict else [])
+            return {f'{t}/omega': node_pos.new_tensor(0.0, dtype=torch.float32) for t in tasks}
+
+        p_gt = node_pos.float()
+        p_pr = pred_pos.float()
+        q0, q1, q2, q3 = quads[:, 0], quads[:, 1], quads[:, 2], quads[:, 3]
+        unfixed_quad = (batch['fixed_pos'][quads] == 0).any(dim=-1)
+
+        gt_sin, gt_cos = self._safe_dihedral_sin_cos(p_gt[q0], p_gt[q1], p_gt[q2], p_gt[q3])
+        pr_sin, pr_cos = self._safe_dihedral_sin_cos(p_pr[q0], p_pr[q1], p_pr[q2], p_pr[q3])
+        cos_delta = (pr_cos * gt_cos + pr_sin * gt_sin).squeeze(-1)
+        per_quad = 1.0 - cos_delta
+
+        if task_batch_dict is None:
+            return {'mixed/omega': self._selected_mean_loss(per_quad, unfixed_quad)}
+
+        batch_quad = batch['node_type_batch'].index_select(0, q1)
+        out = {'mixed/omega': self._selected_mean_loss(per_quad, unfixed_quad)}
+        for task, b_mask in task_batch_dict.items():
+            sel = unfixed_quad & b_mask.index_select(0, batch_quad)
+            out[f'{task}/omega'] = self._selected_mean_loss(per_quad, sel)
+        return out
+
+    def ring_close_loss(self, node_pos, pred_pos, batch, task_batch_dict=None):
+        """Float32 closure bond length smooth L1 loss on `ring_closure_bonds`."""
+        bonds = batch.get('ring_closure_bonds', None)
+        if bonds is None or bonds.shape[0] == 0:
+            tasks = ['mixed'] + (list(task_batch_dict.keys()) if task_batch_dict else [])
+            return {f'{t}/ring_close': node_pos.new_tensor(0.0, dtype=torch.float32) for t in tasks}
+
+        p_gt = node_pos.float()
+        p_pr = pred_pos.float()
+        u, v = bonds[:, 0], bonds[:, 1]
+        unfixed_bond = (batch['fixed_pos'][bonds] == 0).any(dim=-1)
+
+        d_gt = torch.sqrt(((p_gt[u] - p_gt[v]) ** 2).sum(dim=-1) + 1e-8)
+        d_pr = torch.sqrt(((p_pr[u] - p_pr[v]) ** 2).sum(dim=-1) + 1e-8)
+        per_bond = F.smooth_l1_loss(d_pr, d_gt, reduction='none', beta=0.1)
+
+        if task_batch_dict is None:
+            return {'mixed/ring_close': self._selected_mean_loss(per_bond, unfixed_bond)}
+
+        batch_bond = batch['node_type_batch'].index_select(0, u)
+        out = {'mixed/ring_close': self._selected_mean_loss(per_bond, unfixed_bond)}
+        for task, b_mask in task_batch_dict.items():
+            sel = unfixed_bond & b_mask.index_select(0, batch_bond)
+            out[f'{task}/ring_close'] = self._selected_mean_loss(per_bond, sel)
+        return out
     
     def forward(self, batch, outputs, tasked=True):
         
@@ -223,6 +331,12 @@ class IndividualTasksLoss(nn.Module):
             self.dist_loss(gt_dist, pred_dist, unfixed_dist, batch, task_edge_dict),
             self.dihedral_loss(node_pos, pred_pos, batch, task_dih_dict),
         ]
+        if 'chiral' in self.weights:
+            loss_list.append(self.chiral_loss(node_pos, pred_pos, batch, task_batch_dict))
+        if 'omega' in self.weights:
+            loss_list.append(self.omega_loss(node_pos, pred_pos, batch, task_batch_dict))
+        if 'ring_close' in self.weights:
+            loss_list.append(self.ring_close_loss(node_pos, pred_pos, batch, task_batch_dict))
         loss_dict = {k:v for d in loss_list for k,v in d.items()}
 
         # # total los
@@ -247,9 +361,13 @@ class IndividualTasksLoss(nn.Module):
     def pocket_dist_loss(self, batch, outputs):
         gt_pocket_pos = batch['pocket_pos']
         gt_node_pos = batch['node_pos']
+        if gt_pocket_pos.shape[0] == 0 or gt_node_pos.shape[0] == 0:
+            return gt_node_pos.new_tensor(0.0)
         knn_node_pocket = radius(x=gt_pocket_pos, y=gt_node_pos, r=self.pocket_dist_config['radius'],
                                  batch_x=batch['pocket_pos_batch'],
                                  batch_y=batch['node_type_batch'])
+        if knn_node_pocket.shape[1] == 0:
+            return gt_node_pos.new_tensor(0.0)
         gt_dist = torch.norm(gt_node_pos[knn_node_pocket[0]] - gt_pocket_pos[knn_node_pocket[1]], dim=-1)
         
         pred_node_pos = outputs['pred_pos']

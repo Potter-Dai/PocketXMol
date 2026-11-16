@@ -387,6 +387,11 @@ class CategoricalPrior(nn.Module):
         """
 
         
+        if x.numel() == 0:
+            if return_posterior:
+                return x.clone(), torch.empty((0, self.num_classes), dtype=torch.float, device=x.device)
+            return x.clone()
+
         x_onehot = F.one_hot(x, self.num_classes).float()
         info_level_exp = info_level[:, None].expand_as(x_onehot)
 

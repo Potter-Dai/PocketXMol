@@ -24,34 +24,53 @@ def edge_index_to_index_of_edge(edge_index, batch_node):
 
 
 def inc_func_mol3d(self, key, value, *args, **kwargs):
+    num_nodes = len(self['node_type']) if 'node_type' in self else int(self['num_nodes'])
     if key == 'bond_index':
-        return len(self['node_type'])
+        return num_nodes
     elif key == 'edge_index':
-        return len(self['node_type'])
+        return num_nodes
     elif key == 'halfedge_index':
-        return len(self['node_type'])
+        return num_nodes
     # for linking
     elif key in ['node_p1', 'node_p2', 'node_bb', 'node_sc'] or key.startswith('node_part_'):  # index of node of part in mol
-        return len(self['node_type'])
+        return num_nodes
     elif key in ['halfedge_p1', 'halfedge_p2', 'halfedge_p1p2',
                  'halfedge_bb', 'halfedge_sc', 'halfedge_bbsc'] or\
                      key.startswith('halfedge_part_'):  # index of halfedge of part in mol
         return len(self['halfedge_type'])
+    # for Phase 2 cyclic / ncAA chiral & closure annotations
+    elif key in ['ca_anchor_triples', 'ca_chiral_quads', 'amide_omega_quads', 'ring_closure_bonds']:
+        return num_nodes
+    elif key in ['ring_closure_target_len', 'chiral_prompt', 'node_anchor_mask', 'ca_chiral_signs']:
+        return 0
     # for rigid and torsional
     elif key == 'domain_node_index':
-        return torch.tensor([[self['n_domain']], [len(self['node_type'])]]) # [2, 1]
+        return torch.tensor([[self['n_domain']], [num_nodes]]) # [2, 1]
     elif key == 'domain_center_nodes':
-        return len(self['node_type'])
+        return num_nodes
     elif key == 'tor_bonds_anno':
-        n_node = len(self['node_type'])
-        return torch.tensor([0, n_node, n_node])
+        return torch.tensor([0, num_nodes, num_nodes])
     elif key == 'twisted_nodes_anno':
         n_tor = len(self['tor_bonds_anno'])
-        return torch.tensor([n_tor, len(self['node_type'])])
+        return torch.tensor([n_tor, num_nodes])
     elif key == 'dihedral_pairs_anno':
-        n_node = len(self['node_type'])
         n_tor = len(self['tor_bonds_anno'])
-        return torch.tensor([n_tor, n_node, n_node])
+        return torch.tensor([n_tor, num_nodes, num_nodes])
+    return None
+
+
+def cat_dim_func_mol3d(self, key, value, *args, **kwargs):
+    if key in [
+        'ca_anchor_triples',
+        'ca_chiral_quads',
+        'amide_omega_quads',
+        'ring_closure_bonds',
+        'ring_closure_target_len',
+        'chiral_prompt',
+        'node_anchor_mask',
+        'ca_chiral_signs',
+    ]:
+        return 0
     return None
     
     
@@ -93,6 +112,12 @@ class PocketMolData(Data):
         # undefined
         return super().__inc__(key, value, *args, **kwargs)
 
+    def __cat_dim__(self, key, value, *args, **kwargs):
+        cat_dim = cat_dim_func_mol3d(self, key, value, *args, **kwargs)
+        if cat_dim is not None:
+            return cat_dim
+        return super().__cat_dim__(key, value, *args, **kwargs)
+
 
 class Mol3DData(Data):
 
@@ -119,6 +144,12 @@ class Mol3DData(Data):
         if inc is not None:
             return inc
         return super().__inc__(key, value, *args, **kwargs)
+
+    def __cat_dim__(self, key, value, *args, **kwargs):
+        cat_dim = cat_dim_func_mol3d(self, key, value, *args, **kwargs)
+        if cat_dim is not None:
+            return cat_dim
+        return super().__cat_dim__(key, value, *args, **kwargs)
 
 
 def torchify_dict(data):

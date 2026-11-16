@@ -58,11 +58,10 @@ class BaseSampleNoiser:
             self.init_step = config.get('init_step', 1)
             if ref_config is not None:
                 if ref_config.name == 'mixed':
-                    ref_config = [c for c in ref_config.individual if c.name==task_name]
-                    if len(ref_config) > 0:
-                        ref_config = ref_config[0]
-                    else:
-                        ref_config = None
+                    ref_list = [c for c in ref_config.individual if c.name==task_name]
+                    if len(ref_list) == 0 and task_name == 'cycpepdesign':
+                        ref_list = [c for c in ref_config.individual if c.name=='pepdesign']
+                    ref_config = ref_list[0] if len(ref_list) > 0 else None
                 self.ref_prior_config = getattr(ref_config, 'prior', None)
             else:
                 self.ref_prior_config = None
@@ -1622,6 +1621,49 @@ class PepdesignSampleNoiser(BaseSampleNoiser):
         batch['halfedge_type'][~fixed_halfedge] = outputs['pred_halfedge'][~fixed_halfedge].argmax(-1).clone()
         
         return batch
+
+
+@register_sample_noise('cycpepdesign')
+class CycPepDesignSampleNoiser(PepdesignSampleNoiser):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('task_name', 'cycpepdesign')
+        super().__init__(*args, **kwargs)
+
+    def add_noise(self, node_type, node_pos, halfedge_type, batch,
+                  from_prior=False, level_dict=None):
+        setting = self._get_setting(batch)
+        mode = setting['mode']
+        batch_node = getattr(
+            batch, 'node_type_batch',
+            torch.zeros(node_type.shape[0], dtype=torch.long, device=node_pos.device)
+        )
+        n_graphs = int(batch_node.max().item()) + 1 if batch_node.numel() > 0 else 1
+        if batch['pocket_pos'].shape[0] == 0:
+            no_pocket_graph = torch.ones(n_graphs, dtype=torch.bool, device=node_pos.device)
+        elif 'pocket_pos_batch' in batch:
+            p_counts = torch.bincount(batch['pocket_pos_batch'], minlength=n_graphs)
+            no_pocket_graph = (p_counts == 0)
+        else:
+            no_pocket_graph = torch.zeros(n_graphs, dtype=torch.bool, device=node_pos.device)
+        recenter_mask = (mode == 'full') & no_pocket_graph[batch_node]
+
+        if recenter_mask.any():
+            node_pos_center = scatter_mean(node_pos, batch_node, dim=0, dim_size=n_graphs)[batch_node]
+            node_pos = torch.where(recenter_mask.unsqueeze(-1), node_pos - node_pos_center, node_pos)
+            if self.mode == 'train':
+                batch.update({'node_pos': node_pos.clone()})
+
+        in_dict = super().add_noise(
+            node_type, node_pos, halfedge_type, batch,
+            from_prior=from_prior, level_dict=level_dict
+        )
+
+        if recenter_mask.any():
+            pos_in = in_dict['pos']
+            pos_in_center = scatter_mean(pos_in, batch_node, dim=0, dim_size=n_graphs)[batch_node]
+            in_dict['pos'] = torch.where(recenter_mask.unsqueeze(-1), pos_in - pos_in_center, pos_in)
+
+        return in_dict
 
 
 @register_sample_noise('custom')

@@ -1,0 +1,464 @@
+model:
+  name: pm_asym_denoiser
+  pretrained: data/trained_models/pxm/checkpoints/pocketxmol.ckpt
+  enable_chiral_se3: False
+  pocket_dim: 128
+  node_dim: 320
+  addition_node_features: ['is_peptide']
+  add_output: ['confidence']
+  edge_dim: 96
+  pocket:
+    edge_dim: 32
+    hidden_dim: 128
+    num_blocks: 4
+    dist_cfg:
+      num_gaussians: 32
+  denoiser:
+    hidden_dim: 320
+    num_blocks: 6
+    dist_cfg:
+      stop: 15
+      num_gaussians: 64
+    gate_dim: 2
+    context_cfg:
+      edge_dim: 128
+      knn: 32
+      dist_cfg:
+        stop: 20
+        num_gaussians: 64
+        type_: linear
+
+loss:
+  name: individual_tasks
+  weights:
+    node: 1.5
+    pos: 2.5
+    edge: 1.5
+    dist: 0.0005
+    dih: 0.0005
+    fixed_node: 0.1
+    fixed_pos: 0.1
+    fixed_edge: 0.1
+    fixed_dist: 0.0005
+    chiral: 0.5
+    omega: 0.5
+    ring_close: 1.0
+  tasks: [denovo, conf, sbdd, dock, maskfill, fbdd, pepdesign, cycpepdesign]
+  confidence:
+    prob_1A: 0.2
+    weights:
+      node: 1
+      pos: 20
+      edge: 1
+
+common:
+#                      C  N  O  F  P  S  Cl   B   Br   I    Se   <MASK>
+  node_prior_probs: &node_prior_probs [3, 2, 2, 2, 1, 1, 1, 0.3, 0.3, 0.3, 0.3, 13.2]
+  sc_node_prior_probs: &sc_node_prior_probs [65, 10, 12, 4, 0.5, 2.5, 3, 0.3, 1, 0.3, 0.3, 98]
+
+noise:
+  name: mixed
+  individual:
+  - name: denovo
+    prior:
+      node:
+        name: categorical
+        prior_type: predefined
+        prior_probs: *node_prior_probs
+      pos:
+        name: allpos
+        pos:
+          name: gaussian_simple
+          sigma_max: 1
+      edge:
+        name: categorical
+        prior_type: tomask_half
+    level:
+      name: uniform
+      min: 0.
+      max: 1.
+  - name: conf
+    reassign_in: True
+    prior:
+      pos:
+        name: allpos
+        pos:
+          name: gaussian_simple
+          sigma_max: 1
+        torsional:
+          name: torsional
+          sigma_max: 0.3
+    level:
+      name: uniform
+      min: 0.
+      max: 1.
+  - name: sbdd
+    prior:
+      node:
+        name: categorical
+        prior_type: predefined
+        prior_probs: *node_prior_probs
+      pos:
+        name: allpos
+        pos:
+          name: gaussian_simple
+          sigma_max: 1
+      edge:
+        name: categorical
+        prior_type: tomask_half
+    level:
+      name: uniform
+      min: 0.
+      max: 1.
+  - name: dock
+    reassign_in: True
+    prior:
+      pos:
+        name: allpos
+        pos:
+          name: gaussian_simple
+          sigma_func: 'sqrt'
+          sigma_max: 1.0
+        translation:
+          name: translation
+          ve: False
+          mean: 0
+          std: 1
+        rotation:
+          name: rotation
+          sigma_max: 0.0002
+        torsional:
+          name: torsional
+          sigma_max: 0.2
+    level:
+      name: uniform
+      min: 0.
+      max: 1.
+  - name: maskfill
+    prior:
+      part1:
+        node:
+          name: categorical
+          prior_type: predefined
+          prior_probs: *node_prior_probs
+        pos:
+          name: allpos
+          pos:
+            name: gaussian_simple
+          translation:
+            name: translation
+            sigma_max: 1
+          rotation:
+            name: rotation
+            sigma_max: 0.0002
+          torsional:
+            name: torsional
+            sigma_max: 0.2
+        edge:
+          name: categorical
+          prior_type: tomask_half
+      part2:
+        node:
+          name: categorical
+          prior_type: predefined
+          prior_probs: *node_prior_probs
+        pos:
+          name: allpos
+          pos:
+            name: gaussian_simple
+        edge:
+          name: categorical
+          prior_type: tomask_half
+    level:
+      part1:
+        name: uniform
+        min: 0.7
+        max: 1.
+      part2:
+        name: uniform
+        min: 0.
+        max: 1.
+  - name: fbdd
+    prior:
+      part1:
+        pos_only: True
+        pos:
+          name: allpos
+          pos:
+            name: gaussian_simple
+          translation:
+            name: translation
+            sigma_max: 1
+          rotation:
+            name: rotation
+            sigma_max: 0.0002
+          torsional:
+            name: torsional
+            sigma_max: 0.2
+      part2:
+        node:
+          name: categorical
+          prior_type: predefined
+          prior_probs: *node_prior_probs
+        pos:
+          name: allpos
+          pos:
+            name: gaussian_simple
+        edge:
+          name: categorical
+          prior_type: tomask_half
+    level:
+      part1:
+        name: uniform
+        min: 0.
+        max: 1.
+      part2:
+        name: uniform
+        min: 0.
+        max: 1.
+  - name: pepdesign
+    prior:
+      bb:
+        pos_only: True
+        pos:
+          name: allpos
+          pos:
+            name: gaussian_simple
+            sigma_max: 3
+      sc:
+        node:
+          name: categorical
+          prior_type: predefined
+          prior_probs: *sc_node_prior_probs
+        pos:
+          name: allpos
+          pos:
+            name: gaussian_simple
+            sigma_max: 3
+        edge:
+          name: categorical
+          prior_type: tomask_half
+    level:
+      bb:
+        name: uniform
+        min: 0.
+        max: 1.
+      sc:
+        name: uniform
+        min: 0.
+        max: 1.
+  - name: cycpepdesign
+    prior:
+      bb:
+        pos_only: True
+        pos:
+          name: allpos
+          pos:
+            name: gaussian_simple
+            sigma_max: 3
+      sc:
+        node:
+          name: categorical
+          prior_type: predefined
+          prior_probs: *sc_node_prior_probs
+        pos:
+          name: allpos
+          pos:
+            name: gaussian_simple
+            sigma_max: 3
+        edge:
+          name: categorical
+          prior_type: tomask_half
+    level:
+      bb:
+        name: uniform
+        min: 0.
+        max: 1.
+      sc:
+        name: uniform
+        min: 0.
+        max: 1.
+
+transforms:
+  featurizer:
+    use_mask_node: True
+    use_mask_edge: True
+    chem:
+      atomic_numbers: [6,7,8,9,15,16,17, 5,35,53,34]  # C N O F, P S Cl, B Br I Se
+      mol_bond_types: [1, 2, 3, 4]  # single, double, triple, aromatic
+  featurizer_pocket:
+    knn: 32
+  task:
+    name: mixed
+    individual:
+      - name: denovo
+      - name: conf
+        settings:
+          free: 1.0
+      - name: sbdd
+      - name: dock
+        settings:
+          free: 1.0
+      - name: maskfill
+        settings:
+          decomposition:
+            brics: 0.2
+            mmpa: 0.3
+            atom: 0.5
+          order:
+            tree: 0.35
+            inv_tree: 0.3
+            random: 0.35
+          part1_pert:
+            fixed: 0.40
+            free: 0.40
+            small: 0.20
+          known_anchor:
+            all: 0.15
+            partial: 0.2
+            none: 0.65
+      - name: fbdd
+        settings:
+          decomposition:
+            brics: 0.6
+            mmpa: 0.4
+          order:
+            tree: 0.15
+            inv_tree: 0.35
+            random: 0.5
+          part1_pert:
+            free: 1.0
+          known_anchor:
+            all: 0.25
+            partial: 0.25
+            none: 0.5
+      - name: pepdesign
+        settings:
+          mode:
+            full: 0.7
+            sc: 0.2
+            packing: 0.1
+        add_mask_atoms:
+          ratio: 0.1
+          len_mu: 1.4
+          len_sigma: 0.2
+      - name: cycpepdesign
+        chiral_prompt_prob: 0.85
+        settings:
+          mode:
+            full: 0.75
+            sc: 0.15
+            packing: 0.10
+        add_mask_atoms:
+          ratio: 0.1
+          len_mu: 1.4
+          len_sigma: 0.2
+
+data:
+  dataset:
+    root: /flashfs1/work/btdai/PermCycXMol/data_train_phase2
+    assembly_path: assemblies/phase2_assembly.lmdb
+    dbs:
+    - name: cyc_perm
+      lmdb_root: cyc_perm/lmdb
+      lmdb_path:
+        mols: mols.lmdb
+        peptide: peptide.lmdb
+    - name: cyc_topo_aug
+      lmdb_root: cyc_topo_aug/lmdb
+      lmdb_path:
+        mols: mols.lmdb
+        peptide: peptide.lmdb
+    - name: cyc_complex
+      lmdb_root: cyc_complex/lmdb
+      lmdb_path:
+        pocmol10: pocmol10.lmdb
+        peptide: peptide.lmdb
+    - name: pep_replay
+      lmdb_root: pep_replay/lmdb
+      lmdb_path:
+        pocmol10: pocmol10.lmdb
+        peptide: peptide.lmdb
+        decom: decom.lmdb
+    - name: lig_replay
+      lmdb_root: lig_replay/lmdb
+      lmdb_path:
+        pocmol10: pocmol10.lmdb
+        decom: decom.lmdb
+  task_db_weights:
+    cycpepdesign:
+      weight: 0.45
+      db_ratio:
+        cyc_perm: 0.40
+        cyc_topo_aug: 0.35
+        cyc_complex: 0.25
+    pepdesign:
+      weight: 0.12
+      db_ratio:
+        pep_replay: 1.0
+    sbdd:
+      weight: 0.13
+      db_ratio:
+        lig_replay: 0.45
+        pep_replay: 0.25
+        cyc_complex: 0.30
+    dock:
+      weight: 0.12
+      db_ratio:
+        lig_replay: 0.40
+        pep_replay: 0.30
+        cyc_complex: 0.30
+    conf:
+      weight: 0.08
+      db_ratio:
+        cyc_perm: 0.65
+        cyc_topo_aug: 0.35
+    denovo:
+      weight: 0.04
+      db_ratio:
+        cyc_perm: 0.60
+        cyc_topo_aug: 0.40
+    maskfill:
+      weight: 0.04
+      db_ratio:
+        lig_replay: 0.65
+        pep_replay: 0.35
+    fbdd:
+      weight: 0.02
+      db_ratio:
+        lig_replay: 0.70
+        pep_replay: 0.30
+
+train:
+  seed: 2026
+  batch_size: 40
+  num_workers: 4
+  pin_memory: True
+  max_steps: 20_000
+  ckpt_every_n_steps: 1000
+  val_check_interval: &val_check_interval 1000
+  precision: bf16-mixed
+  persistent_workers: True
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  find_unused_parameters: True
+  optimizer:
+    type: adamw
+    lr: 1.e-4
+    backbone_lr: 1.e-4
+    new_lr: 5.e-4
+    weight_decay: 1.e-3
+    beta1: 0.99
+    beta2: 0.999
+  scheduler:
+    warmup_step: 500
+    instance:
+      type: plateau
+      factor: 0.75
+      patience: 10
+      min_lr: 1.e-5
+      cooldown: 5
+    params:
+      interval: step
+      frequency: *val_check_interval
+      monitor: val/loss

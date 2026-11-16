@@ -345,6 +345,187 @@ def procrustes_analysis_one_sample(X, Y):
     return R, translation
 
 
+@torch.no_grad()
+def correct_macrocycle_geometry(batch, pos=None, config=None):
+    """Optional light post-denoising 3D macrocycle geometry corrector (float32).
+
+    Refines:
+      1. Macrocycle closure bond lengths (`ring_closure_bonds` -> `ring_closure_target_len`)
+         and extreme covalent bond stretching (`d > 1.95 A` or `d < 1.15 A`).
+      2. Strained amide omega planarity (`35 deg < |omega| < 145 deg`).
+      3. Optional chiral sign alignment against explicit `chiral_prompt` via exact reflection
+         of attached non-backbone sidechain subtree across the `(N, CA, C)` plane.
+
+    Respects `batch['fixed_pos']` and leaves `batch` unchanged unless caller assigns output.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    bond_iters = int(cfg.get('bond_iters', 15))
+    bond_lr = float(cfg.get('bond_lr', 0.25))
+    omega_iters = int(cfg.get('omega_iters', 5))
+    omega_lr = float(cfg.get('omega_lr', 0.1))
+    fix_chirality = bool(cfg.get('fix_chirality', True))
+
+    pos_orig = batch['node_pos'] if pos is None else pos
+    pos_work = pos_orig.detach().clone().float()
+    n_nodes = pos_work.shape[0]
+    if n_nodes == 0:
+        return pos_orig.clone()
+
+    device = pos_work.device
+    fixed_pos = (
+        batch['fixed_pos'].bool()
+        if 'fixed_pos' in batch
+        else torch.zeros(n_nodes, dtype=torch.bool, device=device)
+    )
+
+    # 1. Ring closure & covalent bond length spring relaxation
+    close_bonds = batch.get('ring_closure_bonds', None)
+    close_lens = batch.get('ring_closure_target_len', None)
+    has_close = close_bonds is not None and close_bonds.numel() > 0
+
+    he_idx = batch.get('halfedge_index', None)
+    he_type = batch.get('halfedge_type', None)
+    cov_u = cov_v = None
+    if he_idx is not None and he_type is not None and he_idx.numel() > 0:
+        cov_mask = (he_type > 0) & (he_type <= 4)
+        if cov_mask.any():
+            cov_u = he_idx[0, cov_mask]
+            cov_v = he_idx[1, cov_mask]
+
+    for _ in range(bond_iters):
+        disp = torch.zeros_like(pos_work)
+        if has_close:
+            cu, cv = close_bonds[:, 0].long(), close_bonds[:, 1].long()
+            target_l = (
+                close_lens.float().to(device)
+                if (close_lens is not None and close_lens.shape[0] == cu.shape[0])
+                else torch.full((cu.shape[0],), 1.45, dtype=torch.float32, device=device)
+            )
+            diff = pos_work[cu] - pos_work[cv]
+            dist = torch.sqrt((diff * diff).sum(dim=-1) + 1e-8)
+            err = dist - target_l
+            vec = bond_lr * (err / dist).unsqueeze(-1) * diff
+            disp = disp - scatter_sum(0.5 * vec, cu, dim=0, dim_size=n_nodes)
+            disp = disp + scatter_sum(0.5 * vec, cv, dim=0, dim_size=n_nodes)
+
+        if cov_u is not None:
+            diff_c = pos_work[cov_u] - pos_work[cov_v]
+            dist_c = torch.sqrt((diff_c * diff_c).sum(dim=-1) + 1e-8)
+            too_long = dist_c > 1.95
+            too_short = dist_c < 1.15
+            if too_long.any() or too_short.any():
+                target_c = torch.where(too_long, 1.54, torch.where(too_short, 1.35, dist_c))
+                err_c = torch.where(too_long | too_short, dist_c - target_c, torch.zeros_like(dist_c))
+                vec_c = (0.5 * bond_lr) * (err_c / dist_c).unsqueeze(-1) * diff_c
+                disp = disp - scatter_sum(0.5 * vec_c, cov_u, dim=0, dim_size=n_nodes)
+                disp = disp + scatter_sum(0.5 * vec_c, cov_v, dim=0, dim_size=n_nodes)
+
+        disp_norm = torch.sqrt((disp * disp).sum(dim=-1, keepdim=True) + 1e-12)
+        disp = disp * (disp_norm.clamp(max=0.35) / disp_norm)
+        pos_work[~fixed_pos] = pos_work[~fixed_pos] + disp[~fixed_pos]
+
+    # 2. Gentle omega amide planarity nudge for strained bonds
+    omega_quads = batch.get('amide_omega_quads', None)
+    if omega_quads is not None and omega_quads.numel() > 0 and omega_iters > 0:
+        q0, q1, q2, q3 = omega_quads[:, 0], omega_quads[:, 1], omega_quads[:, 2], omega_quads[:, 3]
+        for _ in range(omega_iters):
+            sin_o, cos_o = get_dihedral(pos_work[q0], pos_work[q1], pos_work[q2], pos_work[q3])
+            ang = torch.atan2(sin_o.squeeze(-1), cos_o.squeeze(-1))
+            abs_ang = ang.abs()
+            strained = (abs_ang > 0.61) & (abs_ang < 2.53)
+            if not strained.any():
+                break
+            target_ang = torch.where(abs_ang >= (0.5 * torch.pi), torch.sign(ang) * torch.pi, torch.zeros_like(ang))
+            delta_ang = target_ang - ang
+            axis = F.normalize(pos_work[q2] - pos_work[q1], dim=-1, eps=1e-4)
+            r3 = pos_work[q3] - pos_work[q2]
+            perp3 = r3 - (r3 * axis).sum(dim=-1, keepdim=True) * axis
+            tang3 = torch.linalg.cross(axis, perp3, dim=-1)
+            step3 = torch.where(strained.unsqueeze(-1), omega_lr * delta_ang.unsqueeze(-1) * tang3, torch.zeros_like(tang3))
+            n3 = torch.sqrt((step3 * step3).sum(dim=-1, keepdim=True) + 1e-12)
+            step3 = step3 * (n3.clamp(max=0.15) / n3)
+            disp_o = scatter_sum(step3, q3, dim=0, dim_size=n_nodes)
+            pos_work[~fixed_pos] = pos_work[~fixed_pos] + disp_o[~fixed_pos]
+
+    # 3. Optional local sidechain reflection across (N, CA, C) plane if chiral_prompt disagrees
+    ca_triples = batch.get('ca_anchor_triples', None)
+    chiral_prompt = batch.get('chiral_prompt', None)
+    if (
+        fix_chirality
+        and ca_triples is not None
+        and ca_triples.numel() > 0
+        and chiral_prompt is not None
+        and chiral_prompt.numel() > 0
+        and cov_u is not None
+    ):
+        # Build covalent adjacency list once
+        adj = [[] for _ in range(n_nodes)]
+        u_list = cov_u.detach().cpu().tolist()
+        v_list = cov_v.detach().cpu().tolist()
+        for uu, vv in zip(u_list, v_list):
+            adj[uu].append(vv)
+            adj[vv].append(uu)
+
+        def _extract_bb_indices(t):
+            if t.dtype == torch.bool:
+                return torch.nonzero(t, as_tuple=False).view(-1).detach().cpu().tolist()
+            return t.detach().cpu().tolist()
+
+        bb_nodes = set()
+        if 'node_bb' in batch:
+            bb_nodes.update(_extract_bb_indices(batch['node_bb']))
+        if 'node_part_bbanchor' in batch:
+            bb_nodes.update(_extract_bb_indices(batch['node_part_bbanchor']))
+        if 'node_part_bbbody' in batch:
+            bb_nodes.update(_extract_bb_indices(batch['node_part_bbbody']))
+        if 'peptide_is_backbone' in batch:
+            bb_nodes.update(_extract_bb_indices(batch['peptide_is_backbone'].bool()))
+        if not bb_nodes:
+            for t in ca_triples.detach().cpu().tolist():
+                bb_nodes.update(t)
+
+        triples_cpu = ca_triples.detach().cpu().tolist()
+        prompt_cpu = chiral_prompt.detach().cpu().numpy()
+        fixed_cpu = fixed_pos.detach().cpu().numpy()
+
+        for ca_i, n_i, c_i in triples_cpu:
+            t_sign = float(prompt_cpu[ca_i, 0])
+            t_mask = float(prompt_cpu[ca_i, 1])
+            if t_mask < 0.5 or abs(t_sign) < 0.5:
+                continue
+            sc_nbs = [nb for nb in adj[ca_i] if nb not in (n_i, c_i) and not fixed_cpu[nb]]
+            if len(sc_nbs) != 1:
+                continue
+            cb_i = sc_nbs[0]
+            if cb_i in bb_nodes:
+                continue
+            vn = pos_work[n_i] - pos_work[ca_i]
+            vc = pos_work[c_i] - pos_work[ca_i]
+            vcb = pos_work[cb_i] - pos_work[ca_i]
+            normal = torch.linalg.cross(vn, vc, dim=-1)
+            n_norm = normal.norm()
+            if n_norm < 1e-4:
+                continue
+            vol = float((normal * vcb).sum().item())
+            if vol * t_sign < 0.0:
+                a_unit = normal / n_norm
+                # Collect attached non-backbone sidechain subtree starting from cb_i
+                visited = {cb_i}
+                q = [cb_i]
+                while q:
+                    cur = q.pop(0)
+                    for nb in adj[cur]:
+                        if nb not in visited and nb not in bb_nodes and not fixed_cpu[nb]:
+                            visited.add(nb)
+                            q.append(nb)
+                idx_t = torch.tensor(sorted(visited), dtype=torch.long, device=device)
+                rel = pos_work[idx_t] - pos_work[ca_i].unsqueeze(0)
+                proj = (rel * a_unit.unsqueeze(0)).sum(dim=-1, keepdim=True)
+                pos_work[idx_t] = pos_work[idx_t] - 2.0 * proj * a_unit.unsqueeze(0)
+
+    return pos_work.to(pos_orig.dtype)
+
+
 if __name__ == '__main__':
     
     # Original points

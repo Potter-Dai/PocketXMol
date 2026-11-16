@@ -47,8 +47,10 @@ from process.utils_process import (
     make_dummy_mol_with_coordinate,
 )
 from scripts.train_pl import DataModule
+from utils.data import torchify_dict
 from utils.dataset import UseDataset
 from utils.misc import *
+from utils.parser import parse_cyclic_ncaa_mol
 from utils.reconstruct import *
 from utils.sample_noise import get_sample_noiser
 from utils.transforms import *
@@ -76,7 +78,8 @@ def get_input_data(protein_path,
                    input_ligand=None,
                    is_pep=False,
                    pocket_args={},
-                   pocmol_args={}):
+                   pocmol_args={},
+                   auto_parse_cyc=False):
     """
     Process input protein and ligand files for generation.
     
@@ -147,7 +150,30 @@ def get_input_data(protein_path,
         else:  # pepseq_{xxx} - peptide docking from sequence
             pep_info = {}
         pocmol_data.update(pep_info)
-    
+
+    if (auto_parse_cyc or is_pep) and mol is not None:
+        cyc_info = parse_cyclic_ncaa_mol(mol)
+        if is_pep and 'peptide_is_backbone' in pocmol_data:
+            if cyc_info.get('closure_type') in (
+                'thioether', 'sidechain_lactam', 'depsipeptide_or_disulfide'
+            ):
+                cyc_bb = torch.as_tensor(
+                    cyc_info['peptide_is_backbone'], dtype=torch.bool
+                )
+                if cyc_bb.shape == pocmol_data['peptide_is_backbone'].shape:
+                    cyc_info['peptide_is_backbone'] = (
+                        pocmol_data['peptide_is_backbone'].bool() | cyc_bb
+                    )
+            else:
+                cyc_info.pop('peptide_is_backbone', None)
+            for k_keep in (
+                'peptide_pos', 'peptide_atom_name', 'peptide_res_index',
+                'peptide_pep_len', 'peptide_seq',
+            ):
+                if k_keep in pocmol_data:
+                    cyc_info.pop(k_keep, None)
+        pocmol_data.update(torchify_dict(cyc_info))
+
     return pocmol_data, pocket_pdb, mol
 
 
@@ -176,8 +202,12 @@ if __name__ == '__main__':
     # load ckpt and train config
     ckpt = torch.load(config.model.checkpoint, map_location=args.device, weights_only=False)
     cfg_dir = os.path.dirname(config.model.checkpoint).replace('checkpoints', 'train_config')
-    train_config = os.listdir(cfg_dir)
-    train_config = make_config(os.path.join(cfg_dir, ''.join(train_config)))
+    cfg_files = sorted(
+        f for f in os.listdir(cfg_dir) if f.endswith(('.yml', '.yaml'))
+    )
+    if not cfg_files:
+        raise FileNotFoundError(f'No training config YAML found in {cfg_dir}')
+    train_config = make_config(os.path.join(cfg_dir, cfg_files[0]))
 
     save_traj_prob = config.sample.save_traj_prob
     batch_size = config.sample.batch_size if args.batch_size == 0 else args.batch_size
@@ -240,7 +270,8 @@ if __name__ == '__main__':
         input_ligand=data_cfg.get('input_ligand', None),
         is_pep=is_pep,
         pocket_args=data_cfg.get('pocket_args', {}),
-        pocmol_args=data_cfg.get('pocmol_args', {})
+        pocmol_args=data_cfg.get('pocmol_args', {}),
+        auto_parse_cyc=(config.task.name in ('cycpepdesign', 'custom')),
     )
     test_set = UseDataset(data, n=num_mols, task=config.task.name, transforms=transforms)
 
@@ -283,7 +314,17 @@ if __name__ == '__main__':
                 
                 # # prepare batch then sample
                 batch = batch.to(args.device)
-                batch, outputs, trajs = sample_loop3(batch, model, noiser, args.device, is_ar=is_ar)
+                use_corrector = bool(
+                    config.sample.get('use_corrector', False)
+                    or config.sample.get('correct_macrocycle', False)
+                )
+                correct_macrocycle = (
+                    config.sample.get('corrector_cfg', None) or True
+                ) if use_corrector else False
+                batch, outputs, trajs = sample_loop3(
+                    batch, model, noiser, args.device, is_ar=is_ar,
+                    correct_macrocycle=correct_macrocycle,
+                )
                 
                 # # decode outputs to molecules
                 data_list = [{key:batch[key][i] for key in info_keys} for i in range(len(batch))]

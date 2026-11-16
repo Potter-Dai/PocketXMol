@@ -385,12 +385,21 @@ class ForeverTaskDataset(IterableDataset):
             key = f'pocmol10/{data_id};torsion/{data_id};decom/{data_id}'
         elif db_name in ['cremp', 'protacdb']:
             key = f'mols/{data_id}'
+            if self.db_dict is not None and db_name in self.db_dict and 'peptide' in self.db_dict[db_name].lmdb_path:
+                key += f';peptide/{data_id}'
         elif db_name in ['apep']:
             key = f'pocmol10/{data_id};torsion/{data_id};decom/{data_id};peptide/{data_id}'
         elif db_name in ['pepbdb', 'qbpep']:
             key = f'pocmol10/{data_id};peptide/{data_id}'
         elif db_name in ['poseb', 'poseboff']:
             key = f'pocmol10/{data_id}'
+        elif self.db_dict is not None and db_name in self.db_dict and db_name not in self.db_dict[db_name].lmdb_path:
+            sub_keys = [
+                f'{sub_name}/{data_id}'
+                for sub_name in self.db_dict[db_name].lmdb_path.keys()
+                if sub_name not in ('linking', 'growing')
+            ]
+            key = ';'.join(sub_keys)
         else:  # new db. typically for test/use
             # raise ValueError(f'unknown db_name {db_name}')
             key = f'{db_name}/{data_id}'
@@ -577,7 +586,8 @@ class SingleDatabase(Dataset): # modify from Drug3DDataset. directly the keys
                 #     'You must fetch mols or pocmol lmdb as the first lmdb since it contains torch.Data'
                 data = fetch
             else:
-                data.update(fetch)
+                if fetch is not None:
+                    data.update(fetch)
         
         return data
 

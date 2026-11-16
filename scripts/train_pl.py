@@ -185,10 +185,48 @@ class ModelLightning(pl.LightningModule):
                                   num_edge_types=num_edge_types, **kwargs)
         
         if getattr(self.config.model, 'pretrained', ''):
-            ckpt = torch.load(self.config.model.pretrained, map_location='cpu')
-            self.model.load_state_dict({k[6:]:value for k, value in ckpt['state_dict'].items()
-                                        if k.startswith('model.')})
-            print('Load pretrained model from', self.config.model.pretrained)
+            try:
+                ckpt = torch.load(
+                    self.config.model.pretrained, map_location='cpu', weights_only=False
+                )
+            except TypeError:
+                ckpt = torch.load(self.config.model.pretrained, map_location='cpu')
+            raw_sd = (
+                ckpt['state_dict']
+                if isinstance(ckpt, dict) and 'state_dict' in ckpt
+                else ckpt
+            )
+            state_dict = {
+                k[6:]: value for k, value in raw_sd.items()
+                if k.startswith('model.')
+            }
+            if not state_dict:
+                state_dict = {
+                    k: value for k, value in raw_sd.items()
+                    if not k.startswith('loss.')
+                }
+            load_res = self.model.load_state_dict(state_dict, strict=False)
+            assert len(load_res.unexpected_keys) == 0, (
+                f'Unexpected keys loading pretrained ckpt: {load_res.unexpected_keys}'
+            )
+            allowed_new_prefixes = ('chiral_prompt_proj.', 'denoiser.chiral_blocks.')
+            if not bool(getattr(self.model, 'enable_chiral_se3', False)):
+                assert len(load_res.missing_keys) == 0, (
+                    f'Missing keys with enable_chiral_se3=False: {load_res.missing_keys}'
+                )
+            else:
+                bad_missing = [
+                    k for k in load_res.missing_keys
+                    if not any(k.startswith(pref) for pref in allowed_new_prefixes)
+                ]
+                assert len(bad_missing) == 0, (
+                    f'Unexpected missing backbone keys: {bad_missing}'
+                )
+            print(
+                f'Load pretrained model from {self.config.model.pretrained} '
+                f'(loaded={len(state_dict)}, missing_new={len(load_res.missing_keys)}, '
+                f'unexpected={len(load_res.unexpected_keys)})'
+            )
         
 
         self.loss_func = get_loss_func(self.config.loss)
@@ -376,7 +414,46 @@ class ModelLightning(pl.LightningModule):
 
     def configure_optimizers(self):
         # Optimizer and scheduler
-        optimizer = get_optimizer(self.config.train.optimizer, self.model)
+        opt_cfg = self.config.train.optimizer
+        backbone_lr = getattr(opt_cfg, 'backbone_lr', None)
+        new_lr = getattr(opt_cfg, 'new_lr', None)
+        if backbone_lr is not None or new_lr is not None:
+            fallback_lr = backbone_lr if backbone_lr is not None else new_lr
+            base_lr = float(getattr(opt_cfg, 'lr', fallback_lr))
+            backbone_lr = float(base_lr if backbone_lr is None else backbone_lr)
+            new_lr = float(backbone_lr if new_lr is None else new_lr)
+            new_prefixes = ('chiral_prompt_proj.', 'denoiser.chiral_blocks.')
+            backbone_params = []
+            new_params = []
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if any(name.startswith(pref) for pref in new_prefixes):
+                    new_params.append(param)
+                else:
+                    backbone_params.append(param)
+            param_groups = []
+            if backbone_params:
+                param_groups.append({'params': backbone_params, 'lr': backbone_lr})
+            if new_params:
+                param_groups.append({'params': new_params, 'lr': new_lr})
+            opt_type = str(getattr(opt_cfg, 'type', 'adamw')).lower()
+            opt_kwargs = dict(
+                lr=backbone_lr,
+                weight_decay=float(getattr(opt_cfg, 'weight_decay', 0.0)),
+                betas=(
+                    float(getattr(opt_cfg, 'beta1', 0.9)),
+                    float(getattr(opt_cfg, 'beta2', 0.999)),
+                ),
+            )
+            if opt_type == 'adam':
+                optimizer = torch.optim.Adam(param_groups, **opt_kwargs)
+            elif opt_type == 'adamw':
+                optimizer = torch.optim.AdamW(param_groups, **opt_kwargs)
+            else:
+                raise NotImplementedError('Optimizer not supported: %s' % opt_type)
+        else:
+            optimizer = get_optimizer(opt_cfg, self.model)
         scheduler_config = self.config.train.scheduler
         scheduler = get_scheduler(scheduler_config.instance, optimizer)
         self.warmup_step = getattr(scheduler_config, "warmup_step", 0)
@@ -427,9 +504,10 @@ if __name__ == '__main__':
     if is_vscode:
         args.logdir = os.path.join('vscode', args.logdir)
     dir_names = os.path.dirname(args.config).split('/')
-    is_train = dir_names.index('train')
-    names = dir_names[is_train+1:]
-    args.logdir = '/'.join([args.logdir] + names)
+    if 'train' in dir_names:
+        is_train = dir_names.index('train')
+        names = dir_names[is_train+1:]
+        args.logdir = '/'.join([args.logdir] + names)
 
     # Load configs
     config = make_config(args.config)
@@ -477,11 +555,15 @@ if __name__ == '__main__':
         log_every_n_steps=config.train.val_check_interval,
         val_check_interval=config.train.val_check_interval,
         gradient_clip_val=getattr(config.train, 'gradient_clip_val', None),
+        gradient_clip_algorithm=getattr(config.train, 'gradient_clip_algorithm', 'norm'),
         logger=logger,
         num_sanity_val_steps=0,
         profiler='simple' if args.profile else None,
-        strategy='ddp',
-        # strategy='ddp_find_unused_parameters_true',
+        strategy=(
+            'ddp_find_unused_parameters_true'
+            if getattr(config.train, 'find_unused_parameters', False)
+            else 'ddp'
+        ),
         accelerator='gpu',
         # detect_anomaly=True,
         # detect_anomaly=True

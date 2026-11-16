@@ -51,11 +51,280 @@ from process.utils_process import process_raw
 from utils.data import Mol3DData, PocketMolData
 from utils.dataset import *
 from utils.misc import *
+from utils.parser import parse_cyclic_ncaa_mol
 from utils.train_noise import (
     combine_vectors_indexed,
     get_vector,
     get_vector_list,
 )
+
+# PXM heavy-atom vocabulary matching FeaturizeMol / constants.py
+_PXM_ATOMIC_NUMBERS = (6, 7, 8, 9, 15, 16, 17, 5, 35, 53, 34)
+_DEFAULT_MIXED_PATTERN = ('L', 'D', 'L', 'L', 'D', 'L', 'D', 'L')
+
+
+def _reindex_cyclic_annotations_on_remove(data, is_atom_remain):
+    """Re-index Phase 2 cyclic/chiral annotation tensors when nodes are removed."""
+    n_atoms_data = len(is_atom_remain)
+    old_to_new = torch.full((n_atoms_data,), -1, dtype=torch.long)
+    old_to_new[is_atom_remain] = torch.arange(int(is_atom_remain.sum().item()), dtype=torch.long)
+
+    if 'ca_anchor_triples' in data:
+        triples = torch.as_tensor(data['ca_anchor_triples'], dtype=torch.long).reshape(-1, 3)
+        if triples.shape[0] > 0:
+            mapped = old_to_new[triples]
+            keep = (mapped >= 0).all(dim=-1)
+            data['ca_anchor_triples'] = mapped[keep]
+            if 'ca_chiral_signs' in data:
+                signs = torch.as_tensor(data['ca_chiral_signs'], dtype=torch.float).reshape(-1)
+                if signs.shape[0] == keep.shape[0]:
+                    data['ca_chiral_signs'] = signs[keep]
+        else:
+            data['ca_anchor_triples'] = triples
+
+    for key, width in (('ca_chiral_quads', 4), ('amide_omega_quads', 4)):
+        if key in data:
+            quads = torch.as_tensor(data[key], dtype=torch.long).reshape(-1, width)
+            if quads.shape[0] > 0:
+                mapped = old_to_new[quads]
+                data[key] = mapped[(mapped >= 0).all(dim=-1)]
+            else:
+                data[key] = quads
+
+    if 'ring_closure_bonds' in data:
+        bonds = torch.as_tensor(data['ring_closure_bonds'], dtype=torch.long).reshape(-1, 2)
+        if bonds.shape[0] > 0:
+            mapped = old_to_new[bonds]
+            keep = (mapped >= 0).all(dim=-1)
+            data['ring_closure_bonds'] = mapped[keep]
+            if 'ring_closure_target_len' in data:
+                tlen = torch.as_tensor(data['ring_closure_target_len'], dtype=torch.float).reshape(-1)
+                if tlen.shape[0] == keep.shape[0]:
+                    data['ring_closure_target_len'] = tlen[keep]
+        else:
+            data['ring_closure_bonds'] = bonds
+
+    if 'chiral_prompt' in data:
+        cp = torch.as_tensor(data['chiral_prompt'], dtype=torch.float).reshape(-1, 2)
+        if cp.shape[0] == n_atoms_data:
+            data['chiral_prompt'] = cp[is_atom_remain]
+
+    if 'node_anchor_mask' in data:
+        nam = torch.as_tensor(data['node_anchor_mask'], dtype=torch.bool).reshape(-1)
+        if nam.shape[0] == n_atoms_data:
+            data['node_anchor_mask'] = nam[is_atom_remain]
+
+    return data
+
+
+def _pad_cyclic_annotations_on_add(data, n_add):
+    """Pad per-node Phase 2 cyclic annotations when new atoms are appended."""
+    if n_add <= 0:
+        return data
+    if 'chiral_prompt' in data:
+        cp = torch.as_tensor(data['chiral_prompt'], dtype=torch.float).reshape(-1, 2)
+        data['chiral_prompt'] = torch.cat([cp, torch.zeros((n_add, 2), dtype=cp.dtype)], dim=0)
+    if 'node_anchor_mask' in data:
+        nam = torch.as_tensor(data['node_anchor_mask'], dtype=torch.bool).reshape(-1)
+        data['node_anchor_mask'] = torch.cat([nam, torch.zeros((n_add,), dtype=torch.bool)], dim=0)
+    return data
+
+
+def _build_rdmol_from_data(data):
+    """Build a lightweight RDKit Mol from graph tensors for topology/anchor extraction."""
+    from rdkit import Geometry
+    n_nodes = int(data['node_type'].shape[0])
+    if 'element' in data and len(data['element']) == n_nodes:
+        elements = [int(z) for z in data['element']]
+    else:
+        elements = [
+            _PXM_ATOMIC_NUMBERS[int(nt)] if 0 <= int(nt) < len(_PXM_ATOMIC_NUMBERS) else 6
+            for nt in data['node_type']
+        ]
+    rw = Chem.RWMol()
+    conf = Chem.Conformer(n_nodes)
+    pos = data['node_pos'].detach().cpu().numpy()
+    for i, z in enumerate(elements):
+        rw.AddAtom(Chem.Atom(int(z)))
+        conf.SetAtomPosition(i, Geometry.Point3D(float(pos[i, 0]), float(pos[i, 1]), float(pos[i, 2])))
+    rw.AddConformer(conf)
+
+    btype_map = {
+        1: Chem.BondType.SINGLE,
+        2: Chem.BondType.DOUBLE,
+        3: Chem.BondType.TRIPLE,
+        4: Chem.BondType.AROMATIC,
+    }
+    he_idx = data['halfedge_index'].detach().cpu().numpy()
+    he_type = data['halfedge_type'].detach().cpu().numpy()
+    for e_i in range(he_idx.shape[1]):
+        bt = int(he_type[e_i])
+        if bt in btype_map:
+            u, v = int(he_idx[0, e_i]), int(he_idx[1, e_i])
+            if rw.GetBondBetweenAtoms(u, v) is None:
+                rw.AddBond(u, v, btype_map[bt])
+    mol = rw.GetMol()
+    try:
+        Chem.FastFindRings(mol)
+        Chem.AssignStereochemistryFrom3D(mol)
+    except Exception:
+        pass
+    return mol
+
+
+def ensure_cyclic_ncaa_annotations(data):
+    """Populate Phase 2 cyclic/chiral annotations on `data` if absent or empty."""
+    if data.get('_cyclic_parsed', False):
+        return data
+    has_triples = ('ca_anchor_triples' in data) and (torch.as_tensor(data['ca_anchor_triples']).numel() > 0)
+    has_bb = ('peptide_is_backbone' in data) and (len(data['peptide_is_backbone']) == int(data['node_type'].shape[0]))
+    if has_triples and has_bb and ('node_anchor_mask' in data):
+        data['_cyclic_parsed'] = True
+        return data
+
+    mol = _build_rdmol_from_data(data)
+    parsed = parse_cyclic_ncaa_mol(mol)
+
+    if not has_triples:
+        data['ca_anchor_triples'] = torch.as_tensor(parsed['ca_anchor_triples'], dtype=torch.long).reshape(-1, 3)
+        data['ca_chiral_quads'] = torch.as_tensor(parsed['ca_chiral_quads'], dtype=torch.long).reshape(-1, 4)
+        data['ca_chiral_signs'] = torch.as_tensor(parsed['ca_chiral_signs'], dtype=torch.float).reshape(-1)
+        data['amide_omega_quads'] = torch.as_tensor(parsed['amide_omega_quads'], dtype=torch.long).reshape(-1, 4)
+        data['ring_closure_bonds'] = torch.as_tensor(parsed['ring_closure_bonds'], dtype=torch.long).reshape(-1, 2)
+        data['ring_closure_target_len'] = torch.as_tensor(parsed['ring_closure_target_len'], dtype=torch.float).reshape(-1)
+        data['closure_type'] = parsed['closure_type']
+        data['has_d_aa'] = parsed['has_d_aa']
+        data['has_nme'] = parsed['has_nme']
+        data['has_halogen_or_hetero'] = parsed['has_halogen_or_hetero']
+        data['is_canonical_all_l'] = parsed['is_canonical_all_l']
+
+    if not has_bb:
+        data['peptide_is_backbone'] = torch.as_tensor(parsed['peptide_is_backbone'], dtype=torch.bool)
+        data['peptide_atom_name'] = parsed['peptide_atom_name']
+        data['peptide_res_index'] = torch.as_tensor(parsed['peptide_res_index'], dtype=torch.long)
+        data['peptide_pep_len'] = parsed['peptide_pep_len']
+        data['peptide_seq'] = parsed['peptide_seq']
+    else:
+        data['peptide_is_backbone'] = torch.as_tensor(data['peptide_is_backbone'], dtype=torch.bool)
+
+    if 'node_anchor_mask' not in data or len(data['node_anchor_mask']) != int(data['node_type'].shape[0]):
+        data['node_anchor_mask'] = torch.as_tensor(parsed['node_anchor_mask'], dtype=torch.bool)
+
+    data['_cyclic_parsed'] = True
+    return data
+
+
+def _parse_single_chiral_token(token):
+    if token is None:
+        return (0.0, 0.0)
+    if isinstance(token, (int, float, np.integer, np.floating)):
+        v = float(token)
+        if v > 0:
+            return (1.0, 1.0)
+        if v < 0:
+            return (-1.0, 1.0)
+        return (0.0, 1.0)
+    s = str(token).strip().lower()
+    if s in ('l', '+1', '1'):
+        return (1.0, 1.0)
+    if s in ('d', '-1'):
+        return (-1.0, 1.0)
+    if s in ('achiral', 'g', 'gly', '0'):
+        return (0.0, 1.0)
+    if s in ('free', '?', 'none', ''):
+        return (0.0, 0.0)
+    raise ValueError(f'Unknown per-residue chiral token: {token}')
+
+
+def build_chiral_prompt(
+    n_nodes,
+    ca_anchor_triples,
+    node_pos=None,
+    ca_chiral_quads=None,
+    ca_chiral_signs=None,
+    chiral_spec='free',
+    train_mode=False,
+    prompt_prob=0.85,
+):
+    """Build `[N_atoms, 2]` `(sign, mask)` chirality conditioning prompt on CA atoms."""
+    prompt = torch.zeros((n_nodes, 2), dtype=torch.float)
+    if ca_anchor_triples is None:
+        return prompt
+    triples = torch.as_tensor(ca_anchor_triples, dtype=torch.long).reshape(-1, 3)
+    n_ca = triples.shape[0]
+    if n_ca == 0:
+        return prompt
+
+    ca_indices = triples[:, 0]
+    if train_mode:
+        # Compute ground-truth CA chirality signs directly from 3D conformer quads if available
+        sign_by_ca = {}
+        if ca_chiral_quads is not None and node_pos is not None:
+            quads = torch.as_tensor(ca_chiral_quads, dtype=torch.long).reshape(-1, 4)
+            if quads.shape[0] > 0:
+                pos_f = node_pos.float()
+                vn = pos_f[quads[:, 1]] - pos_f[quads[:, 0]]
+                vc = pos_f[quads[:, 2]] - pos_f[quads[:, 0]]
+                vcb = pos_f[quads[:, 3]] - pos_f[quads[:, 0]]
+                vols = (torch.linalg.cross(vn, vc, dim=-1) * vcb).sum(dim=-1)
+                for q_i in range(quads.shape[0]):
+                    v_val = float(vols[q_i].item())
+                    if abs(v_val) > 1e-4:
+                        sign_by_ca[int(quads[q_i, 0].item())] = 1.0 if v_val > 0.0 else -1.0
+
+        signs_fallback = None
+        if ca_chiral_signs is not None:
+            sf = torch.as_tensor(ca_chiral_signs, dtype=torch.float).reshape(-1)
+            if sf.shape[0] == n_ca:
+                signs_fallback = sf
+
+        keep = torch.rand(n_ca) < float(prompt_prob)
+        for i in range(n_ca):
+            if not bool(keep[i].item()):
+                continue
+            ca_i = int(ca_indices[i].item())
+            if ca_i in sign_by_ca:
+                s_val = sign_by_ca[ca_i]
+            elif signs_fallback is not None:
+                s_val = float(signs_fallback[i].item())
+            else:
+                s_val = 0.0
+            prompt[ca_i, 0] = s_val
+            prompt[ca_i, 1] = 1.0
+        return prompt
+
+    spec = 'free' if chiral_spec is None else chiral_spec
+    if isinstance(spec, str):
+        key = spec.strip().lower()
+        if key in ('all_l', 'l'):
+            prompt[ca_indices, 0] = 1.0
+            prompt[ca_indices, 1] = 1.0
+        elif key in ('all_d', 'd'):
+            prompt[ca_indices, 0] = -1.0
+            prompt[ca_indices, 1] = 1.0
+        elif key == 'mixed':
+            for i in range(n_ca):
+                s_val, m_val = _parse_single_chiral_token(_DEFAULT_MIXED_PATTERN[i % len(_DEFAULT_MIXED_PATTERN)])
+                prompt[ca_indices[i], 0] = s_val
+                prompt[ca_indices[i], 1] = m_val
+        elif key in ('achiral', 'gly', 'g'):
+            prompt[ca_indices, 0] = 0.0
+            prompt[ca_indices, 1] = 1.0
+        elif key in ('free', 'none', ''):
+            pass
+        else:
+            raise ValueError(f'Unknown chiral_spec: {chiral_spec}')
+    elif isinstance(spec, (list, tuple)):
+        if len(spec) == 0:
+            return prompt
+        for i in range(n_ca):
+            s_val, m_val = _parse_single_chiral_token(spec[i % len(spec)])
+            prompt[ca_indices[i], 0] = s_val
+            prompt[ca_indices[i], 1] = m_val
+    else:
+        raise ValueError(f'Unsupported chiral_spec type: {type(spec)}')
+
+    return prompt
 
 # Configuration constants for different generation modes
 CONF_SETTINGS = ['free', 'flexible', 'torsional', 'rigid']
@@ -443,6 +712,7 @@ class VariableScSize(object):  # for sampling
             'peptide_atom_name': new_peptide_atom_name,
             'added_index': added_index,  # for custom task to know the part name of the added nodes
         })
+        _pad_cyclic_annotations_on_add(data, n_add)
         return data
     
     
@@ -452,7 +722,7 @@ class VariableScSize(object):  # for sampling
         peptide_is_sc = ~peptide_is_backbone
         
         
-        peptide_is_removable = peptide_is_sc
+        peptide_is_removable = peptide_is_sc.clone()
         peptide_is_removable[self.not_remove] = False
         # n_bb, n_sc = peptide_is_backbone.sum(), peptide_is_sc.sum()
         n_removable = peptide_is_removable.sum().item()
@@ -478,6 +748,7 @@ class VariableScSize(object):  # for sampling
         data['peptide_is_backbone'] = data['peptide_is_backbone'][is_atom_remain]
         data['peptide_atom_name'] = [name for is_r, name in zip(is_atom_remain, data['peptide_atom_name'])
                                      if is_r]
+        _reindex_cyclic_annotations_on_remove(data, is_atom_remain)
         
         return data
 
@@ -594,6 +865,12 @@ class VariableMolSize(object):  # for sampling
             # 'peptide_atom_name': new_peptide_atom_name,
             'added_index': added_index,  # for custom task to know the part name of the added nodes
         })
+        if 'peptide_is_backbone' in data:
+            pbb = torch.as_tensor(data['peptide_is_backbone'], dtype=torch.bool)
+            data['peptide_is_backbone'] = torch.cat([pbb, torch.zeros([n_add], dtype=torch.bool)], dim=0)
+        if 'peptide_atom_name' in data and isinstance(data['peptide_atom_name'], list):
+            data['peptide_atom_name'] = data['peptide_atom_name'] + ['X'] * n_add
+        _pad_cyclic_annotations_on_add(data, n_add)
         return data
     
     
@@ -623,10 +900,11 @@ class VariableMolSize(object):  # for sampling
             edge_attr=data.halfedge_type, relabel_nodes=True, num_nodes=n_atoms_data)
         data['halfedge_index'] = halfedge_index
         data['halfedge_type'] = halfedge_type
-        # peptide
-        # data['peptide_is_backbone'] = data['peptide_is_backbone'][is_atom_remain]
-        # data['peptide_atom_name'] = [name for is_r, name in zip(is_atom_remain, data['peptide_atom_name'])
-        #                              if is_r]
+        if 'peptide_is_backbone' in data:
+            data['peptide_is_backbone'] = torch.as_tensor(data['peptide_is_backbone'], dtype=torch.bool)[is_atom_remain]
+        if 'peptide_atom_name' in data and isinstance(data['peptide_atom_name'], list):
+            data['peptide_atom_name'] = [name for is_r, name in zip(is_atom_remain, data['peptide_atom_name']) if is_r]
+        _reindex_cyclic_annotations_on_remove(data, is_atom_remain)
         
         return data
 
@@ -742,6 +1020,10 @@ class FeaturizeMol(object):
                              'peptide_pos', 'peptide_atom_name', 'peptide_is_backbone',
                              'peptide_res_id', 'peptide_atom_to_aa_type', 'peptide_res_index',
                              'peptide_seq', 'peptide_pep_len', 'peptide_pep_path',
+                             # Phase 2 transform-only cyclic metadata
+                             'node_anchor_mask', 'ca_chiral_signs', '_cyclic_parsed',
+                             'closure_type', 'has_macrocycle', 'macrocycle_size',
+                             'has_d_aa', 'has_nme', 'has_halogen_or_hetero', 'is_canonical_all_l',
                              ]
         
         self.mol_as_pocket_center = config.get('mol_as_pocket_center', False)
@@ -798,6 +1080,35 @@ class FeaturizeMol(object):
             data['is_peptide'] = torch.ones([data.num_nodes], dtype=torch.long)
         else:
             data['is_peptide'] = torch.zeros([data.num_nodes], dtype=torch.long)  # default is not peptide
+
+        # Ensure uniform Phase 2 tensor fields exist on every sample for mixed-task PyG collation
+        if 'peptide_is_backbone' in data:
+            data['peptide_is_backbone'] = torch.as_tensor(data['peptide_is_backbone'], dtype=torch.bool)
+        if 'node_anchor_mask' in data:
+            data['node_anchor_mask'] = torch.as_tensor(data['node_anchor_mask'], dtype=torch.bool)
+        if 'ca_chiral_signs' in data:
+            data['ca_chiral_signs'] = torch.as_tensor(data['ca_chiral_signs'], dtype=torch.float).reshape(-1)
+
+        for key, shape, dtype in (
+            ('ca_anchor_triples', (0, 3), torch.long),
+            ('ca_chiral_quads', (0, 4), torch.long),
+            ('amide_omega_quads', (0, 4), torch.long),
+            ('ring_closure_bonds', (0, 2), torch.long),
+        ):
+            if key in data and data[key] is not None:
+                data[key] = torch.as_tensor(data[key], dtype=dtype).reshape(-1, shape[1])
+            else:
+                data[key] = torch.empty(shape, dtype=dtype)
+
+        if 'ring_closure_target_len' in data and data['ring_closure_target_len'] is not None:
+            data['ring_closure_target_len'] = torch.as_tensor(data['ring_closure_target_len'], dtype=torch.float).reshape(-1)
+        else:
+            data['ring_closure_target_len'] = torch.empty((0,), dtype=torch.float)
+
+        if 'chiral_prompt' in data and data['chiral_prompt'] is not None:
+            data['chiral_prompt'] = torch.as_tensor(data['chiral_prompt'], dtype=torch.float).reshape(-1, 2)
+        else:
+            data['chiral_prompt'] = torch.zeros((data.num_nodes, 2), dtype=torch.float)
 
         return data
     
@@ -2130,16 +2441,24 @@ class PepdesignTransform:
         halfedge_sc = subgraph(node_sc, halfedge_index, i_all_halfedge)[1]
         i_all_halfedge[halfedge_bb] = -1
         i_all_halfedge[halfedge_sc] = -1
-        halfedge_bbsc = torch.nonzero(i_all_halfedge >= 0, as_tuple=False).squeeze()
-        # anchor, i.e., CA atoms
-        is_known_halfedge_bbsc = torch.zeros(halfedge_bbsc.shape[0], dtype=torch.bool)
-        peptide_atom_name = np.array(data['peptide_atom_name'])
-        n_or_ca_atoms = np.nonzero(
-            (peptide_atom_name == 'CA') | (peptide_atom_name == 'N')
-        )[0]  # proline also connects to N
-        node_anchor = torch.tensor([n for n in n_or_ca_atoms if n in node_bb])
+        halfedge_bbsc = torch.nonzero(i_all_halfedge >= 0, as_tuple=False).squeeze(-1)
+        # anchor, i.e., CA/N atoms (or node_anchor_mask when provided)
+        if 'node_anchor_mask' in data and len(data['node_anchor_mask']) == data['node_type'].shape[0]:
+            anchor_mask = torch.as_tensor(data['node_anchor_mask'], dtype=torch.bool)
+            is_bb_mask = torch.zeros(data['node_type'].shape[0], dtype=torch.bool)
+            is_bb_mask[node_bb] = True
+            node_anchor = torch.nonzero(anchor_mask & is_bb_mask, as_tuple=False).squeeze(-1)
+        else:
+            peptide_atom_name = np.array(data['peptide_atom_name'])
+            n_or_ca_atoms = np.nonzero(
+                (peptide_atom_name == 'CA') | (peptide_atom_name == 'N')
+            )[0]  # proline also connects to N
+            node_anchor = torch.tensor([n for n in n_or_ca_atoms if n in node_bb], dtype=torch.long)
         halfedge_index_bbsc = halfedge_index[:, halfedge_bbsc]
-        is_known_halfedge_bbsc = (halfedge_index_bbsc[..., None] != node_anchor).all(-1).all(0)
+        if node_anchor.numel() == 0:
+            is_known_halfedge_bbsc = torch.ones(halfedge_bbsc.shape[0], dtype=torch.bool)
+        else:
+            is_known_halfedge_bbsc = (halfedge_index_bbsc[..., None] != node_anchor).all(-1).all(0)
         
         partition = {
             'node_bb': node_bb,
@@ -2222,8 +2541,70 @@ class PepdesignTransform:
         })
         if 'is_peptide' in data:
             is_peptide = data['is_peptide']
-            data['is_peptide'] = torch.cat([is_peptide, torch.ones([n_add], dtype=is_peptide.dtype)], dim=0)
+            fill_val = is_peptide[0].item() if is_peptide.numel() > 0 else 1
+            data['is_peptide'] = torch.cat([is_peptide, fill_val * torch.ones([n_add], dtype=is_peptide.dtype)], dim=0)
+        _pad_cyclic_annotations_on_add(data, n_add)
 
+        return data
+
+
+@register_transforms('cycpepdesign')
+class CycPepDesignTransform(PepdesignTransform):
+    """Phase 2 cyclic & ncAA peptide design transform with chiral prompting and dynamic is_peptide."""
+
+    def __init__(self, config, **kwargs) -> None:
+        super().__init__(config, **kwargs)
+        self.chiral_prompt_prob = float(config.get('chiral_prompt_prob', 0.85))
+        self.chiral_spec = config.get('chiral_spec', 'free')
+        self.config_is_peptide = config.get('is_peptide', None)
+
+    def _is_canonical_all_l_sample(self, data) -> bool:
+        if bool(data.get('has_d_aa', False)) or bool(data.get('has_nme', False)) or bool(data.get('has_halogen_or_hetero', False)):
+            return False
+        if bool(data.get('has_macrocycle', False)) and data.get('closure_type', '') != 'head_to_tail':
+            return False
+        if 'is_canonical_all_l' in data:
+            return bool(data['is_canonical_all_l'])
+        seq = str(data.get('peptide_seq', 'X'))
+        return ('X' not in seq) and len(seq) > 0
+
+    def __call__(self, data: Mol3DData):
+        data = ensure_cyclic_ncaa_annotations(data)
+        setting = self.sample_setting()
+        data.update({'task_setting': setting})
+
+        n_nodes = data['node_type'].shape[0]
+        if self.mode == 'train':
+            if self._is_canonical_all_l_sample(data):
+                is_pep_val = 1 if np.random.rand() < 0.5 else 0
+            else:
+                is_pep_val = 0
+        else:
+            is_pep_val = int(self.config_is_peptide) if self.config_is_peptide is not None else 0
+        data['is_peptide'] = torch.full((n_nodes,), is_pep_val, dtype=data['is_peptide'].dtype)
+
+        if setting['mode'] in ['full', 'sc']:
+            if self.add_mask_atoms and self.mode != 'test':
+                data = self.add_atoms(data)
+
+        data = self.pre_make_partition(data)
+        data, num_part_dict = self.make_partition_features(data)
+        data = self.set_fixed(data, setting, num_part_dict)
+        data = self.set_torsional_feat(data)
+
+        data['chiral_prompt'] = build_chiral_prompt(
+            n_nodes=data['node_type'].shape[0],
+            ca_anchor_triples=data.get('ca_anchor_triples', None),
+            node_pos=data.get('node_pos', None),
+            ca_chiral_quads=data.get('ca_chiral_quads', None),
+            ca_chiral_signs=data.get('ca_chiral_signs', None),
+            chiral_spec=self.chiral_spec,
+            train_mode=(self.mode == 'train'),
+            prompt_prob=self.chiral_prompt_prob,
+        )
+
+        if self.mode == 'test':
+            data = self.prepare_sample(data, setting)
         return data
 
 
@@ -2428,6 +2809,7 @@ class CustomTransform:
 
     def __call__(self, data: Mol3DData):
         self._check_name(data)
+        data = ensure_cyclic_ncaa_annotations(data)
         
         # make partiotion
         data, _ = self.make_partition_features(data)
@@ -2437,8 +2819,20 @@ class CustomTransform:
         data = self.set_torsional_feat(data)
         
         # is_peptide
-        is_peptide = self.is_peptide
+        is_peptide = int(self.is_peptide)
         data['is_peptide'] = is_peptide * torch.ones_like(data['is_peptide'])
+
+        # chiral_prompt (supports chiral_spec in CustomTransform configs)
+        chiral_spec = self.config.get('chiral_spec', 'free')
+        data['chiral_prompt'] = build_chiral_prompt(
+            n_nodes=data['node_type'].shape[0],
+            ca_anchor_triples=data.get('ca_anchor_triples', None),
+            node_pos=data.get('node_pos', None),
+            ca_chiral_quads=data.get('ca_chiral_quads', None),
+            ca_chiral_signs=data.get('ca_chiral_signs', None),
+            chiral_spec=chiral_spec,
+            train_mode=False,
+        )
 
         return data
 

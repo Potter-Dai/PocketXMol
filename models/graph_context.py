@@ -297,11 +297,20 @@ class ContextNodeEdgeNet(Module):
         self.local_update = kwargs.get('local_update', False)
         if self.local_update:
             self.local_net = LocalPosUpdate(node_dim, edge_dim, node_dim, cutoff=3.8)
+
+        self.enable_chiral_se3 = bool(kwargs.get('enable_chiral_se3', False)) and (not node_only)
+        if self.enable_chiral_se3:
+            chiral_hidden = int(kwargs.get('chiral_hidden_dim', 64))
+            self.chiral_blocks = ModuleList([
+                SE3ChiralUpdate(node_dim, edge_dim, hidden_dim=chiral_hidden)
+                for _ in range(num_blocks)
+            ])
         
                 
     def forward(self, h_node, pos_node, h_edge, edge_index,
                 node_extra, edge_extra, batch_node=None,
-                h_ctx=None, pos_ctx=None, batch_ctx=None):
+                h_ctx=None, pos_ctx=None, batch_ctx=None,
+                ca_anchor_triples=None):
         """
         graph node/edge features
             h_node: (n_node, node_dim)
@@ -320,6 +329,7 @@ class ContextNodeEdgeNet(Module):
             h_edge: (n_edge, edge_dim)
             pos_node: (n_node, 3)
         """
+        has_ctx = (h_ctx is not None) and (pos_ctx is not None) and (pos_ctx.shape[0] > 0)
 
         for i in range(self.num_blocks):
             # # remake edge fetures (distance have been changed in each iteration)
@@ -332,7 +342,7 @@ class ContextNodeEdgeNet(Module):
             h_edge = self.edge_embs[i](h_edge)
             
             # # edge with context
-            if h_ctx is not None:
+            if has_ctx:
                 h_ctx_edge, vec_ctx, dist_ctx, ctx_knn_edge_index = self._build_context_edges_dist(
                     pos_node, pos_ctx, batch_node, batch_ctx)
                 h_ctx_edge = self.ctx_edge_embs[i](h_ctx_edge)
@@ -342,7 +352,7 @@ class ContextNodeEdgeNet(Module):
 
             # # node feature updates
             h_node = self.node_blocks_with_edge[i](h_node, edge_index, h_edge, node_extra,
-                                        h_ctx, ctx_knn_edge_index, h_ctx_edge)
+                                        h_ctx if has_ctx else None, ctx_knn_edge_index, h_ctx_edge)
             if self.node_only:
                 continue
             
@@ -351,10 +361,21 @@ class ContextNodeEdgeNet(Module):
 
             # # pos updates
             pos_node = pos_node + self.pos_blocks[i](h_node, h_edge, edge_index, relative_vec, distance, node_extra, edge_extra)
-            if h_ctx is not None:
+            if has_ctx:
                 pos_node = pos_node + self.ctx_pos_blocks[i](
                     h_node, h_ctx_edge, ctx_knn_edge_index, vec_ctx, dist_ctx, node_extra,
                     edge_extra=None, h_node_right=h_ctx)
+
+            if self.enable_chiral_se3:
+                dh_chiral, dpos_chiral = self.chiral_blocks[i](
+                    h_node=h_node,
+                    pos_node=pos_node,
+                    h_edge=h_edge,
+                    edge_index=edge_index,
+                    ca_anchor_triples=ca_anchor_triples,
+                )
+                h_node = h_node + dh_chiral
+                pos_node = pos_node + dpos_chiral
 
         if self.local_update:
             pos_node = pos_node + self.local_net(h_node, pos_node, h_edge, edge_index, batch_node)
@@ -640,5 +661,209 @@ class TorsionNet(nn.Module):
             twisted_edge, i_tor_edge_for_twisted_edge
         )
         return pos_update, angles
+
+
+class SE3ChiralUpdate(Module):
+    """Vectorized O(N) SE(3)-equivariant, E(3) parity-breaking chiral update block.
+
+    Branch 1 (anchored CA axial frame):
+        Computes normalized axial vector `a = normalize((x_N - x_CA) x (x_C - x_CA))` in float32,
+        senses signed projection `s = <a, x_m - x_CA>` onto short edges `(CA, m)` to update `h_node`
+        and applies an SO(3)-equivariant axial pos force clamped to [-0.5, 0.5] A (zero-init outputs).
+
+    Branch 2 (general chiral centers):
+        Selects top-4 closest neighbors (`dist < 2.5 A`) per node in vectorized O(N) and computes
+        pairwise unit-vector cross products `u_j1 x u_j2` weighted by antisymmetric learned weights
+        `w(h_i, h_j1, h_j2) - w(h_i, h_j2, h_j1)` (zero-init output).
+    """
+
+    def __init__(self, node_dim, edge_dim, hidden_dim=64, branch1_cutoff=3.5, branch2_cutoff=2.5):
+        super().__init__()
+        self.node_dim = node_dim
+        self.edge_dim = edge_dim
+        self.hidden_dim = hidden_dim
+        self.branch1_cutoff = float(branch1_cutoff)
+        self.branch2_cutoff = float(branch2_cutoff)
+
+        # Branch 1: CA axial sensing & force
+        b1_in_dim = node_dim * 2 + edge_dim + 3
+        self.b1_node_mlp = nn.Sequential(
+            Linear(b1_in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            Linear(hidden_dim, node_dim),
+        )
+        nn.init.zeros_(self.b1_node_mlp[-1].weight)
+        nn.init.zeros_(self.b1_node_mlp[-1].bias)
+
+        self.b1_pos_mlp = nn.Sequential(
+            Linear(b1_in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.b1_pos_mlp[-1].weight)
+        nn.init.zeros_(self.b1_pos_mlp[-1].bias)
+
+        # Branch 2: Top-4 short neighbor pairwise cross products with antisymmetric weights
+        self.b2_center_proj = Linear(node_dim, hidden_dim)
+        self.b2_nbr_proj = Linear(node_dim + edge_dim, hidden_dim)
+        self.b2_weight_mlp = nn.Sequential(
+            Linear(hidden_dim * 3, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.b2_weight_mlp[-1].weight)
+        nn.init.zeros_(self.b2_weight_mlp[-1].bias)
+
+        pair_a = torch.tensor([0, 0, 0, 1, 1, 2], dtype=torch.long)
+        pair_b = torch.tensor([1, 2, 3, 2, 3, 3], dtype=torch.long)
+        self.register_buffer('pair_a', pair_a, persistent=False)
+        self.register_buffer('pair_b', pair_b, persistent=False)
+
+    @staticmethod
+    def _radial_clamp(vec32, max_norm=0.5):
+        norm = torch.sqrt((vec32 * vec32).sum(dim=-1, keepdim=True) + 1e-12)
+        scale = norm.clamp(max=max_norm) / norm
+        return vec32 * scale
+
+    def forward(self, h_node, pos_node, h_edge, edge_index, ca_anchor_triples=None):
+        N = h_node.shape[0]
+        device = h_node.device
+        dtype = h_node.dtype
+        pos32 = pos_node.float()
+
+        dh_node = torch.zeros_like(h_node)
+        dpos32 = torch.zeros((N, 3), dtype=torch.float32, device=device)
+
+        if N == 0 or edge_index.numel() == 0:
+            return dh_node, dpos32.to(pos_node.dtype)
+
+        row, col = edge_index[0], edge_index[1]
+        vec32 = pos32[col] - pos32[row]
+        dist32 = torch.sqrt((vec32 * vec32).sum(dim=-1) + 1e-10)
+
+        # --- Branch 1: Anchored CA axial frame ---
+        if ca_anchor_triples is not None and ca_anchor_triples.numel() > 0:
+            triples = ca_anchor_triples.long()
+            M = triples.shape[0]
+            ca_idx, n_idx, c_idx = triples[:, 0], triples[:, 1], triples[:, 2]
+            v_n = pos32[n_idx] - pos32[ca_idx]
+            v_c = pos32[c_idx] - pos32[ca_idx]
+            raw_cross = torch.linalg.cross(v_n, v_c, dim=-1)
+            cross_norm = torch.sqrt((raw_cross * raw_cross).sum(dim=-1, keepdim=True) + 1e-12)
+            valid_frame = (cross_norm.squeeze(-1) > 1e-4).float().unsqueeze(-1)
+            axial = (raw_cross / cross_norm.clamp(min=1e-4)) * valid_frame  # [M, 3]
+
+            ca_id_of_node = torch.full((N,), -1, dtype=torch.long, device=device)
+            ca_id_of_node[ca_idx] = torch.arange(M, dtype=torch.long, device=device)
+            edge_ca_id = ca_id_of_node[row]
+            b1_mask = (
+                (edge_ca_id >= 0)
+                & (col != row)
+                & (dist32 < self.branch1_cutoff)
+                & (dist32 > 1e-4)
+            )
+            if b1_mask.any():
+                b1_e = torch.nonzero(b1_mask, as_tuple=False).squeeze(-1)
+                m_id_e = edge_ca_id[b1_e]
+                col_e = col[b1_e]
+                keep_sc = (col_e != n_idx[m_id_e]) & (col_e != c_idx[m_id_e])
+                if keep_sc.any():
+                    b1_e = b1_e[keep_sc]
+                    m_id_e = m_id_e[keep_sc]
+                    ca_e = row[b1_e]
+                    m_node_e = col[b1_e]
+                    r_e = vec32[b1_e]
+                    d_e = dist32[b1_e]
+                    a_e = axial[m_id_e]
+
+                    s_e = (a_e * r_e).sum(dim=-1)  # signed axial projection (A)
+                    s_hat_e = s_e / d_e.clamp(min=1e-4)
+                    # Smooth radial envelope -> 0 at branch1_cutoff
+                    env_e = 0.5 * (1.0 + torch.cos(torch.pi * (d_e / self.branch1_cutoff).clamp(0.0, 1.0)))
+
+                    feat_e = torch.cat([
+                        h_node[ca_e],
+                        h_node[m_node_e],
+                        h_edge[b1_e],
+                        s_e.unsqueeze(-1).to(dtype),
+                        s_hat_e.unsqueeze(-1).to(dtype),
+                        d_e.unsqueeze(-1).to(dtype),
+                    ], dim=-1)
+
+                    msg_h = self.b1_node_mlp(feat_e) * env_e.unsqueeze(-1).to(dtype)
+                    dh_node = dh_node + scatter_sum(msg_h, ca_e, dim=0, dim_size=N)
+
+                    alpha = torch.clamp(self.b1_pos_mlp(feat_e).squeeze(-1).float(), -0.5, 0.5) * env_e
+                    force_e = alpha.unsqueeze(-1) * a_e
+                    dpos_b1 = scatter_sum(force_e, m_node_e, dim=0, dim_size=N) - scatter_sum(
+                        force_e, ca_e, dim=0, dim_size=N
+                    )
+                    dpos32 = dpos32 + self._radial_clamp(dpos_b1, 0.5)
+
+        # --- Branch 2: Vectorized top-4 short bonded neighbors pairwise cross products ---
+        short_mask = (row != col) & (dist32 < self.branch2_cutoff) & (dist32 > 1e-4)
+        if short_mask.any():
+            src = row[short_mask]
+            dst = col[short_mask]
+            d_s = dist32[short_mask]
+            u_s = vec32[short_mask] / d_s.unsqueeze(-1).clamp(min=1e-4)
+            he_s = h_edge[short_mask]
+
+            # Group by src and sort ascending by distance in O(E_short log E_short) without Python loops
+            perm1 = torch.argsort(d_s)
+            perm2 = torch.argsort(src[perm1], stable=True)
+            perm = perm1[perm2]
+            src_s = src[perm]
+            dst_s = dst[perm]
+            u_s = u_s[perm]
+            he_s = he_s[perm]
+            d_s = d_s[perm]
+
+            counts = torch.bincount(src_s, minlength=N)
+            starts = torch.cumsum(counts, dim=0) - counts
+            rank = torch.arange(src_s.shape[0], device=device) - starts[src_s]
+            top4 = rank < 4
+
+            src_4 = src_s[top4]
+            dst_4 = dst_s[top4]
+            r_4 = rank[top4]
+            u_4 = u_s[top4]
+            d_4 = d_s[top4]
+            he_4 = he_s[top4]
+
+            h_center = self.b2_center_proj(h_node)
+            nbr_feat_4 = self.b2_nbr_proj(torch.cat([h_node[dst_4], he_4], dim=-1))
+            # Smooth cutoff ramp over [2.0, 2.5] A for exact SO(3) boundary continuity
+            env_4 = ((self.branch2_cutoff - d_4) / 0.5).clamp(min=0.0, max=1.0)
+
+            nbr_valid = torch.zeros((N, 4), dtype=torch.bool, device=device)
+            nbr_unit = torch.zeros((N, 4, 3), dtype=torch.float32, device=device)
+            nbr_h = torch.zeros((N, 4, self.hidden_dim), dtype=h_center.dtype, device=device)
+            nbr_env = torch.zeros((N, 4), dtype=torch.float32, device=device)
+
+            nbr_valid[src_4, r_4] = True
+            nbr_unit[src_4, r_4] = u_4
+            nbr_h[src_4, r_4] = nbr_feat_4
+            nbr_env[src_4, r_4] = env_4
+
+            pa, pb = self.pair_a, self.pair_b
+            valid_pair = nbr_valid[:, pa] & nbr_valid[:, pb]  # [N, 6]
+            env_pair = nbr_env[:, pa] * nbr_env[:, pb] * valid_pair.float()
+
+            hi_rep = h_center.unsqueeze(1).expand(-1, 6, -1)
+            hj1 = nbr_h[:, pa, :]
+            hj2 = nbr_h[:, pb, :]
+            w12 = self.b2_weight_mlp(torch.cat([hi_rep, hj1, hj2], dim=-1)).squeeze(-1).float()
+            w21 = self.b2_weight_mlp(torch.cat([hi_rep, hj2, hj1], dim=-1)).squeeze(-1).float()
+            w_anti = (w12 - w21) * env_pair
+
+            cross_12 = torch.linalg.cross(nbr_unit[:, pa, :], nbr_unit[:, pb, :], dim=-1)  # [N, 6, 3]
+            dpos_b2 = (w_anti.unsqueeze(-1) * cross_12).sum(dim=1)
+            dpos32 = dpos32 + self._radial_clamp(dpos_b2, 0.5)
+
+        return dh_node, dpos32.to(pos_node.dtype)
 
 
