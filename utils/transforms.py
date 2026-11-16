@@ -1335,7 +1335,13 @@ class ConfTransform:
             data = self.prepare_sample(data, setting)
             
         if self.mode != 'train':
-            fixed_distmat_flex = torch.LongTensor(data['fixed_dist_torsion'])
+            if 'fixed_dist_torsion' in data and data['fixed_dist_torsion'] is not None:
+                fixed_distmat_flex = torch.LongTensor(data['fixed_dist_torsion'])
+            else:
+                fixed_distmat_flex = torch.zeros(
+                    (data['node_type'].shape[0], data['node_type'].shape[0]),
+                    dtype=torch.long,
+                )
             fixed_halfdist_flex = fixed_distmat_flex[data['halfedge_index'][0], data['halfedge_index'][1]]
             data.update({
                 'fixed_halfdist_flex': fixed_halfdist_flex
@@ -1878,20 +1884,49 @@ class MaskfillTransform:
         })
         return data
 
+    @staticmethod
+    def _build_atom_nbh_from_bond_index(bond_index, n_nodes):
+        """Build undirected atom neighbor dict from bond_index when torsion.lmdb nbh_dict is absent."""
+        nbh_dict = {i: [] for i in range(n_nodes)}
+        if bond_index is None or n_nodes == 0:
+            return nbh_dict
+        src, dst = bond_index[0], bond_index[1]
+        if hasattr(src, 'tolist'):
+            src, dst = src.tolist(), dst.tolist()
+        for u, v in zip(src, dst):
+            u_i, v_i = int(u), int(v)
+            if 0 <= u_i < n_nodes and 0 <= v_i < n_nodes and u_i != v_i:
+                if v_i not in nbh_dict[u_i]:
+                    nbh_dict[u_i].append(v_i)
+                if u_i not in nbh_dict[v_i]:
+                    nbh_dict[v_i].append(u_i)
+        return nbh_dict
+
     def graph_to_tree_order(self, nbh_list, size_tree):
         n = len(nbh_list)
+        if size_tree <= 0 or n == 0:
+            return np.array([], dtype=np.int64)
         tree_order = []
-        pool = [random.randint(0, n-1)] # 0, 1, ..., n-1
+        visited = set()
+        pool = [random.randint(0, n - 1)]  # 0, 1, ..., n-1
         while len(tree_order) < size_tree:  # only explore size_tree nodes
-            #print('in loop 924')
-            curr = np.random.choice(pool)
+            if len(pool) == 0:
+                # Restart BFS/tree growth on a remaining disconnected component.
+                remaining = [idx for idx in range(n) if idx not in visited]
+                if not remaining:
+                    break
+                pool = [random.choice(remaining)]
+            curr = int(np.random.choice(pool))
             tree_order.append(curr)
+            visited.add(curr)
             pool.remove(curr)
-            pool.extend([nb for nb in nbh_list[curr] if
-                         (nb not in tree_order) and (nb not in pool)])
+            pool.extend([
+                int(nb) for nb in nbh_list[curr]
+                if (int(nb) not in visited) and (int(nb) not in pool)
+            ])
         assert len(tree_order) == size_tree, 'not enough nodes in the tree order'
         assert len(set(tree_order)) == size_tree, 'tree order has duplicate nodes'
-        return np.array(tree_order)
+        return np.array(tree_order, dtype=np.int64)
     
     def partition_from_preset(self, data: Mol3DData):
         preset_partition = self.preset_partition.copy()
@@ -1956,11 +1991,17 @@ class MaskfillTransform:
         setting_order = setting['order']
         
         # # subgraph neighborhood
-        if setting_decom in ['brics', 'mmpa']:
+        if setting_decom in ['brics', 'mmpa'] and setting_decom in data and data[setting_decom] is not None:
             decom_dict = data[setting_decom]
             nbh_subgraphs = decom_dict['nbh_subgraphs']
-        else:  # atoms
-            nbh_subgraphs = data['nbh_dict']  # fake. an atom is a subgraph
+        else:  # atoms (or fallback when decom key is unavailable)
+            if setting_decom != 'atom':
+                setting_decom = 'atom'
+                setting['decomposition'] = 'atom'
+            if 'nbh_dict' in data and data['nbh_dict'] is not None:
+                nbh_subgraphs = data['nbh_dict']  # fake. an atom is a subgraph
+            else:
+                nbh_subgraphs = self._build_atom_nbh_from_bond_index(data['bond_index'], n_nodes)
             assert n_nodes == len(nbh_subgraphs), 'atom nbh info is not complete'
         n_subgraphs = len(nbh_subgraphs)
         
@@ -1978,7 +2019,8 @@ class MaskfillTransform:
                 subgraph_p1 = self.graph_to_tree_order(nbh_subgraphs, size_tree=n_p1)
             elif  setting_order == 'inv_tree':
                 subgraph_p2 = self.graph_to_tree_order(nbh_subgraphs, size_tree=n_p2)
-                subgraph_p1 = np.array([i for i in range(n_subgraphs) if i not in subgraph_p2])
+                subgraph_p2_set = set(subgraph_p2.tolist())
+                subgraph_p1 = np.array([i for i in range(n_subgraphs) if i not in subgraph_p2_set], dtype=np.int64)
         else:  # random
             subgraph_p1 = np.random.permutation(n_subgraphs)[:n_p1]
 
@@ -2080,7 +2122,7 @@ class MaskfillTransform:
         
             i_all_halfedge[halfedge_p1] = -1
             i_all_halfedge[halfedge_p2] = -1
-            halfedge_p1p2 = torch.nonzero(i_all_halfedge >= 0, as_tuple=False).squeeze()
+            halfedge_p1p2 = torch.nonzero(i_all_halfedge >= 0, as_tuple=False).squeeze(-1)
             # another way
             edge_index, i_all_edge = to_undirected(halfedge_index, i_all_halfedge)
             halfedge_p1p2_way2 = bipartite_subgraph([node_p1, node_p2], edge_index, i_all_edge)[1]
@@ -2110,7 +2152,7 @@ class MaskfillTransform:
             is_known_halfedge_p1p2 = (halfedge_index_p1p2[..., None] == node_known_outer_edge).any(-1).any(0)
         elif known_anchor == 'all':
             # is_known_halfedge_p1p2 = torch.ones(halfedge_p1p2.shape[0], dtype=torch.bool)
-            node_anchor = torch.tensor(sum(grouped_anchor_p1, []))
+            node_anchor = torch.tensor(sum(grouped_anchor_p1, []), dtype=torch.long)
             halfedge_index_p1p2 = halfedge_index[:, halfedge_p1p2]
             is_known_halfedge_p1p2 = (halfedge_index_p1p2[..., None] != node_anchor).all(-1).all(0)
         else:

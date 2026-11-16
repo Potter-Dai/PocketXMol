@@ -660,8 +660,10 @@ class ConfSampleNoiser(BaseSampleNoiser):
         return in_dict
 
     def reassign_in_node(self, batch, in_dict):
-        if (self.mode == 'train') and ('is_atom_remain' not in batch):  # not applicable for cutt peptide
+        if (self.mode == 'train') and ('is_atom_remain' not in batch) and ('matches_iso' in batch):  # not applicable for cutt peptide or dbs without torsion.lmdb
             matches_iso = batch['matches_iso']
+            if matches_iso is None or len(matches_iso) == 0:
+                return in_dict
             base_order = np.sort(matches_iso[0])
             # assert (np.diff(base_order)>0).sum(), 'base_order should be in ascending order'
             node_pos = batch['node_pos'][base_order]  # (n, 3)
