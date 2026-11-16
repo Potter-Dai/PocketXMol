@@ -6,6 +6,7 @@ from easydict import EasyDict
 from torch_scatter import scatter_mean, scatter_min
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 from copy import deepcopy
 from scipy.optimize import linear_sum_assignment
 
@@ -170,6 +171,90 @@ class BaseSampleNoiser:
     
     def additional_process(self, batch, in_dict):
         return in_dict
+
+    def _sample_discrete_outputs(self, batch, outputs, fixed_node, fixed_halfedge):
+        """Sample or argmax node and halfedge classes with optional annealed stochasticity."""
+        stoch_cfg = self.config.get('stochastic_sampling', None)
+        pred_node = outputs['pred_node']
+        pred_edge = outputs['pred_halfedge']
+        if not stoch_cfg or not bool(stoch_cfg.get('enable', False)):
+            return pred_node.argmax(-1).clone(), pred_edge.argmax(-1).clone()
+
+        step_raw = batch.get('step', 0.0)
+        step_val = float(step_raw.item() if torch.is_tensor(step_raw) else step_raw)
+        freeze_below = float(stoch_cfg.get('freeze_below_step', 0.25))
+        n_nodes = pred_node.shape[0]
+        device = pred_node.device
+
+        bb_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
+        if 'node_bb' in batch and batch['node_bb'] is not None:
+            bb_mask[batch['node_bb']] = True
+        for k_bb in ('node_part_bbanchor', 'node_part_bbbody'):
+            if k_bb in batch and batch[k_bb] is not None:
+                bb_mask[batch[k_bb]] = True
+        if not bb_mask.any():
+            bb_mask = fixed_node.clone()
+        sc_mask = ~bb_mask
+        unfixed_sc = (~fixed_node) & sc_mask
+
+        bb_anchor_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
+        if 'node_part_bbanchor' in batch and batch['node_part_bbanchor'] is not None:
+            bb_anchor_mask[batch['node_part_bbanchor']] = True
+        elif 'node_bb' in batch and batch['node_bb'] is not None:
+            bb_anchor_mask[batch['node_bb']] = True
+        else:
+            bb_anchor_mask = bb_mask
+
+        node_logits = pred_node.float().clone()
+        edge_logits = pred_edge.float().clone()
+
+        if step_val > freeze_below:
+            node_bias_cfg = stoch_cfg.get('node_logit_bias', None)
+            if node_bias_cfg is not None and unfixed_sc.any():
+                bias_t = torch.as_tensor(node_bias_cfg, dtype=torch.float32, device=device)
+                if bias_t.numel() == node_logits.shape[-1]:
+                    node_logits[unfixed_sc] = node_logits[unfixed_sc] + bias_t.unsqueeze(0)
+
+            suppress_mask = stoch_cfg.get('suppress_mask_sample', False)
+            mask_cls = node_logits.shape[-1] - 1
+            if suppress_mask is True:
+                node_logits[:, mask_cls] = -1e9
+            elif (not isinstance(suppress_mask, bool)) and isinstance(suppress_mask, (int, float)) and suppress_mask > 0:
+                node_logits[:, mask_cls] = node_logits[:, mask_cls] - float(suppress_mask)
+
+            nme_bias = float(stoch_cfg.get('nme_edge_logit_bias', 0.0))
+            if nme_bias != 0.0 and 'halfedge_index' in batch and edge_logits.shape[-1] > 1:
+                he_idx = batch['halfedge_index']
+                is_anchor_n = bb_anchor_mask & (batch['node_type'] == 1)
+                nme_edge_mask = (~fixed_halfedge) & (
+                    (is_anchor_n[he_idx[0]] & sc_mask[he_idx[1]])
+                    | (is_anchor_n[he_idx[1]] & sc_mask[he_idx[0]])
+                )
+                if nme_edge_mask.any():
+                    edge_logits[nme_edge_mask, 1] = edge_logits[nme_edge_mask, 1] + nme_bias
+
+            node_temp = max(float(stoch_cfg.get('node_temp', 1.0)), 1e-4)
+            edge_temp = max(float(stoch_cfg.get('edge_temp', 0.85)), 1e-4)
+
+            sampled_node = pred_node.argmax(-1).clone()
+            unfixed_node_idx = ~fixed_node
+            if unfixed_node_idx.any():
+                node_probs = F.softmax(node_logits[unfixed_node_idx] / node_temp, dim=-1)
+                sampled_node[unfixed_node_idx] = torch.multinomial(node_probs, num_samples=1).squeeze(-1)
+
+            sampled_edge = pred_edge.argmax(-1).clone()
+            unfixed_edge_idx = ~fixed_halfedge
+            if unfixed_edge_idx.any():
+                edge_probs = F.softmax(edge_logits[unfixed_edge_idx] / edge_temp, dim=-1)
+                sampled_edge[unfixed_edge_idx] = torch.multinomial(edge_probs, num_samples=1).squeeze(-1)
+            return sampled_node, sampled_edge
+
+        final_bias_cfg = stoch_cfg.get('final_node_logit_bias', None)
+        if final_bias_cfg is not None and unfixed_sc.any():
+            bias_t = torch.as_tensor(final_bias_cfg, dtype=torch.float32, device=device)
+            if bias_t.numel() == node_logits.shape[-1]:
+                node_logits[unfixed_sc] = node_logits[unfixed_sc] + bias_t.unsqueeze(0)
+        return node_logits.argmax(-1).clone(), edge_logits.argmax(-1).clone()
 
     @torch.no_grad()
     def __call__(self, batch, step=None):
@@ -1618,9 +1703,12 @@ class PepdesignSampleNoiser(BaseSampleNoiser):
         fixed_pos = (batch['fixed_pos'] == 1)
         fixed_halfedge = (batch['fixed_halfedge'] == 1)
 
-        batch['node_type'][~fixed_node] = outputs['pred_node'][~fixed_node].argmax(-1).clone()
+        sampled_node, sampled_edge = self._sample_discrete_outputs(
+            batch, outputs, fixed_node, fixed_halfedge
+        )
+        batch['node_type'][~fixed_node] = sampled_node[~fixed_node]
         batch['node_pos'][~fixed_pos] = outputs['pred_pos'][~fixed_pos].clone()
-        batch['halfedge_type'][~fixed_halfedge] = outputs['pred_halfedge'][~fixed_halfedge].argmax(-1).clone()
+        batch['halfedge_type'][~fixed_halfedge] = sampled_edge[~fixed_halfedge]
         
         return batch
 
@@ -1780,9 +1868,12 @@ class CustomSampleNoiser(BaseSampleNoiser):
                                 part in self.correction['edge']])
             halfedge_corrected = batch['halfedge_type'][halfedge_part_corr].clone()
         
-        batch['node_type'][~fixed_node] = outputs['pred_node'][~fixed_node].argmax(-1).clone()
+        sampled_node, sampled_edge = self._sample_discrete_outputs(
+            batch, outputs, fixed_node, fixed_halfedge
+        )
+        batch['node_type'][~fixed_node] = sampled_node[~fixed_node]
         batch['node_pos'][~fixed_pos] = outputs['pred_pos'][~fixed_pos].clone()
-        batch['halfedge_type'][~fixed_halfedge] = outputs['pred_halfedge'][~fixed_halfedge].argmax(-1).clone()
+        batch['halfedge_type'][~fixed_halfedge] = sampled_edge[~fixed_halfedge]
 
         # # apply correction
         if 'node' in self.correction:
