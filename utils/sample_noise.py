@@ -182,9 +182,21 @@ class BaseSampleNoiser:
 
         step_raw = batch.get('step', 0.0)
         step_val = float(step_raw.item() if torch.is_tensor(step_raw) else step_raw)
-        freeze_below = float(stoch_cfg.get('freeze_below_step', 0.25))
+        node_freeze_below = float(
+            stoch_cfg.get('node_freeze_below_step', stoch_cfg.get('freeze_below_step', 0.25))
+        )
+        edge_freeze_below = float(
+            stoch_cfg.get('edge_freeze_below_step', stoch_cfg.get('freeze_below_step', 0.25))
+        )
+        stochastic_edges_only_nme = bool(stoch_cfg.get('stochastic_edges_only_nme', False))
+
         n_nodes = pred_node.shape[0]
+        n_edges = pred_edge.shape[0]
+        mask_cls = pred_node.shape[-1] - 1
         device = pred_node.device
+        cur_nodes = batch['node_type']
+        cur_he = batch.get('halfedge_type', None)
+        he_idx = batch.get('halfedge_index', None)
 
         bb_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
         if 'node_bb' in batch and batch['node_bb'] is not None:
@@ -208,7 +220,87 @@ class BaseSampleNoiser:
         node_logits = pred_node.float().clone()
         edge_logits = pred_edge.float().clone()
 
-        if step_val > freeze_below:
+        # 1. Top-1-per-anchor valence-safe N-Me edge selection, sampling, and preservation
+        top1_nme_mask = torch.zeros(n_edges, dtype=torch.bool, device=device)
+        if he_idx is not None and n_edges > 0 and edge_logits.shape[-1] > 1:
+            fixed_bond_deg = torch.zeros(n_nodes, dtype=torch.long, device=device)
+            if cur_he is not None:
+                fixed_cov = fixed_halfedge & (cur_he >= 1) & (cur_he <= 4)
+                if fixed_cov.any():
+                    ones_fc = torch.ones(int(fixed_cov.sum().item()), dtype=torch.long, device=device)
+                    fixed_bond_deg.scatter_add_(0, he_idx[0, fixed_cov], ones_fc)
+                    fixed_bond_deg.scatter_add_(0, he_idx[1, fixed_cov], ones_fc)
+
+            is_anchor_n = bb_anchor_mask & (cur_nodes == 1) & (fixed_bond_deg <= 2)
+            cand_u_is_n = (~fixed_halfedge) & is_anchor_n[he_idx[0]] & sc_mask[he_idx[1]]
+            cand_v_is_n = (~fixed_halfedge) & is_anchor_n[he_idx[1]] & sc_mask[he_idx[0]]
+            cand_nme = cand_u_is_n | cand_v_is_n
+            if cand_nme.any():
+                cand_eids = torch.nonzero(cand_nme, as_tuple=False).view(-1)
+                cand_n_nodes = torch.where(
+                    cand_u_is_n[cand_eids], he_idx[0, cand_eids], he_idx[1, cand_eids]
+                )
+                scores = edge_logits[cand_eids, 1] - edge_logits[cand_eids, 0]
+                best_by_n = {}
+                for e_id, n_id, sc_val in zip(
+                    cand_eids.tolist(), cand_n_nodes.tolist(), scores.tolist()
+                ):
+                    prev = best_by_n.get(n_id)
+                    if prev is None or sc_val > prev[0]:
+                        best_by_n[n_id] = (sc_val, e_id)
+                for _, e_id in best_by_n.values():
+                    top1_nme_mask[e_id] = True
+
+            if step_val > edge_freeze_below:
+                nme_bias = float(stoch_cfg.get('nme_edge_logit_bias', 0.0))
+                if nme_bias != 0.0 and top1_nme_mask.any():
+                    edge_logits[top1_nme_mask, 1] = edge_logits[top1_nme_mask, 1] + nme_bias
+            else:
+                final_nme_bias = float(stoch_cfg.get('final_nme_edge_logit_bias', 0.0))
+                if final_nme_bias != 0.0 and top1_nme_mask.any() and cur_he is not None:
+                    sc_at_edge = torch.where(is_anchor_n[he_idx[0]], he_idx[1], he_idx[0])
+                    top1_nme_preserve = top1_nme_mask & (cur_he == 1) & (cur_nodes[sc_at_edge] == 0)
+                    if top1_nme_preserve.any():
+                        edge_logits[top1_nme_preserve, 1] = (
+                            edge_logits[top1_nme_preserve, 1] + final_nme_bias
+                        )
+
+        sampled_edge = edge_logits.argmax(-1).clone()
+        if step_val > edge_freeze_below:
+            edge_temp = max(float(stoch_cfg.get('edge_temp', 0.85)), 1e-4)
+            stoch_edge_mask = top1_nme_mask if stochastic_edges_only_nme else (~fixed_halfedge)
+            if stoch_edge_mask.any():
+                edge_probs = F.softmax(edge_logits[stoch_edge_mask] / edge_temp, dim=-1)
+                sampled_edge[stoch_edge_mask] = torch.multinomial(edge_probs, num_samples=1).squeeze(-1)
+        if cur_he is not None and fixed_halfedge.any():
+            sampled_edge[fixed_halfedge] = cur_he[fixed_halfedge]
+
+        # 2. Valence-safe monovalent-terminal halogen preservation (F=3, Cl=6, Br=8, I=9)
+        bond_count = torch.zeros(n_nodes, dtype=torch.long, device=device)
+        single_to_c_count = torch.zeros(n_nodes, dtype=torch.long, device=device)
+        if he_idx is not None and n_edges > 0:
+            real_bond = (sampled_edge >= 1) & (sampled_edge <= 4)
+            if real_bond.any():
+                ones_rb = torch.ones(int(real_bond.sum().item()), dtype=torch.long, device=device)
+                bond_count.scatter_add_(0, he_idx[0, real_bond], ones_rb)
+                bond_count.scatter_add_(0, he_idx[1, real_bond], ones_rb)
+
+            pred_nonmask = (
+                node_logits[:, :mask_cls].argmax(-1) if mask_cls > 0 else node_logits.argmax(-1)
+            )
+            eff_partner = torch.where(fixed_node, cur_nodes, pred_nonmask)
+            is_c_partner = (cur_nodes == 0) | (eff_partner == 0)
+            single_bond = sampled_edge == 1
+            if single_bond.any():
+                sb_u = he_idx[0, single_bond]
+                sb_v = he_idx[1, single_bond]
+                single_to_c_count.scatter_add_(0, sb_u, is_c_partner[sb_v].long())
+                single_to_c_count.scatter_add_(0, sb_v, is_c_partner[sb_u].long())
+
+        mono_c_sc = unfixed_sc & (bond_count == 1) & (single_to_c_count == 1)
+
+        sampled_node = pred_node.argmax(-1).clone()
+        if step_val > node_freeze_below:
             node_bias_cfg = stoch_cfg.get('node_logit_bias', None)
             if node_bias_cfg is not None and unfixed_sc.any():
                 bias_t = torch.as_tensor(node_bias_cfg, dtype=torch.float32, device=device)
@@ -216,45 +308,95 @@ class BaseSampleNoiser:
                     node_logits[unfixed_sc] = node_logits[unfixed_sc] + bias_t.unsqueeze(0)
 
             suppress_mask = stoch_cfg.get('suppress_mask_sample', False)
-            mask_cls = node_logits.shape[-1] - 1
             if suppress_mask is True:
                 node_logits[:, mask_cls] = -1e9
-            elif (not isinstance(suppress_mask, bool)) and isinstance(suppress_mask, (int, float)) and suppress_mask > 0:
+            elif (
+                (not isinstance(suppress_mask, bool))
+                and isinstance(suppress_mask, (int, float))
+                and suppress_mask > 0
+            ):
                 node_logits[:, mask_cls] = node_logits[:, mask_cls] - float(suppress_mask)
 
-            nme_bias = float(stoch_cfg.get('nme_edge_logit_bias', 0.0))
-            if nme_bias != 0.0 and 'halfedge_index' in batch and edge_logits.shape[-1] > 1:
-                he_idx = batch['halfedge_index']
-                is_anchor_n = bb_anchor_mask & (batch['node_type'] == 1)
-                nme_edge_mask = (~fixed_halfedge) & (
-                    (is_anchor_n[he_idx[0]] & sc_mask[he_idx[1]])
-                    | (is_anchor_n[he_idx[1]] & sc_mask[he_idx[0]])
-                )
-                if nme_edge_mask.any():
-                    edge_logits[nme_edge_mask, 1] = edge_logits[nme_edge_mask, 1] + nme_bias
-
             node_temp = max(float(stoch_cfg.get('node_temp', 1.0)), 1e-4)
-            edge_temp = max(float(stoch_cfg.get('edge_temp', 0.85)), 1e-4)
-
-            sampled_node = pred_node.argmax(-1).clone()
             unfixed_node_idx = ~fixed_node
             if unfixed_node_idx.any():
                 node_probs = F.softmax(node_logits[unfixed_node_idx] / node_temp, dim=-1)
                 sampled_node[unfixed_node_idx] = torch.multinomial(node_probs, num_samples=1).squeeze(-1)
+        else:
+            final_bias_cfg = stoch_cfg.get('final_node_logit_bias', None)
+            if final_bias_cfg is not None and mono_c_sc.any():
+                bias_t = torch.as_tensor(final_bias_cfg, dtype=torch.float32, device=device)
+                if bias_t.numel() == node_logits.shape[-1]:
+                    node_logits[mono_c_sc] = node_logits[mono_c_sc] + bias_t.unsqueeze(0)
 
-            sampled_edge = pred_edge.argmax(-1).clone()
-            unfixed_edge_idx = ~fixed_halfedge
-            if unfixed_edge_idx.any():
-                edge_probs = F.softmax(edge_logits[unfixed_edge_idx] / edge_temp, dim=-1)
-                sampled_edge[unfixed_edge_idx] = torch.multinomial(edge_probs, num_samples=1).squeeze(-1)
-            return sampled_node, sampled_edge
+            if bool(stoch_cfg.get('preserve_sampled_halogens', False)) and mono_c_sc.any():
+                h_boost = float(stoch_cfg.get('preserve_halogen_boost', 1.6))
+                for h_cls in (3, 6, 8):
+                    if h_cls < node_logits.shape[-1]:
+                        h_mask = mono_c_sc & (cur_nodes == h_cls)
+                        if h_mask.any():
+                            node_logits[h_mask, h_cls] = node_logits[h_mask, h_cls] + h_boost
 
-        final_bias_cfg = stoch_cfg.get('final_node_logit_bias', None)
-        if final_bias_cfg is not None and unfixed_sc.any():
-            bias_t = torch.as_tensor(final_bias_cfg, dtype=torch.float32, device=device)
-            if bias_t.numel() == node_logits.shape[-1]:
-                node_logits[unfixed_sc] = node_logits[unfixed_sc] + bias_t.unsqueeze(0)
-        return node_logits.argmax(-1).clone(), edge_logits.argmax(-1).clone()
+            if bool(stoch_cfg.get('guard_halogen_valence', True)):
+                non_mono_sc = unfixed_sc & (~mono_c_sc)
+                if non_mono_sc.any():
+                    for h_cls in (3, 6, 8, 9):
+                        if h_cls < node_logits.shape[-1]:
+                            node_logits[non_mono_sc, h_cls] = (
+                                node_logits[non_mono_sc, h_cls] - 1e4
+                            )
+
+            if (~fixed_node).any():
+                sampled_node[~fixed_node] = node_logits[~fixed_node].argmax(-1)
+
+        if fixed_node.any():
+            sampled_node[fixed_node] = cur_nodes[fixed_node]
+
+        # 3. Final-step unattached slack <MASK> absorption
+        absorb_below = float(
+            stoch_cfg.get(
+                'absorb_unconnected_below_step',
+                1.5 / max(int(getattr(self, 'num_steps', 100)), 1),
+            )
+        )
+        if (
+            bool(stoch_cfg.get('absorb_unconnected_sc', False))
+            and step_val <= absorb_below
+            and fixed_node.any()
+            and he_idx is not None
+            and n_edges > 0
+        ):
+            real_nonmask_bond = (
+                (sampled_edge >= 1)
+                & (sampled_edge <= 4)
+                & (sampled_node[he_idx[0]] < mask_cls)
+                & (sampled_node[he_idx[1]] < mask_cls)
+            )
+            reachable = fixed_node.clone()
+            if real_nonmask_bond.any():
+                rb_u = he_idx[0, real_nonmask_bond]
+                rb_v = he_idx[1, real_nonmask_bond]
+                for _ in range(16):
+                    new_reach = reachable.clone()
+                    prop_u = rb_u[reachable[rb_v]]
+                    prop_v = rb_v[reachable[rb_u]]
+                    if prop_u.numel() > 0:
+                        new_reach[prop_u] = True
+                    if prop_v.numel() > 0:
+                        new_reach[prop_v] = True
+                    if torch.equal(new_reach, reachable):
+                        break
+                    reachable = new_reach
+            orphan_sc = (~fixed_node) & (~reachable) & (sampled_node < mask_cls)
+            if orphan_sc.any():
+                sampled_node[orphan_sc] = mask_cls
+            mask_touch = (~fixed_halfedge) & (
+                (sampled_node[he_idx[0]] == mask_cls) | (sampled_node[he_idx[1]] == mask_cls)
+            )
+            if mask_touch.any():
+                sampled_edge[mask_touch] = 0
+
+        return sampled_node, sampled_edge
 
     @torch.no_grad()
     def __call__(self, batch, step=None):
