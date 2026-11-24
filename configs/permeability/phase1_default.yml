@@ -1,0 +1,45 @@
+# Phase 1 3D Chameleonic Permeability & DeltaPerm Default Config
+pxm_ckpt: /lustre/home/btdai/projects/PermCycXMol/weights/data/trained_models/pxm/checkpoints/pocketxmol.ckpt
+lmdb_path: /flashfs1/work/btdai/PermCycXMol/lmdb_hot/perm_v1.lmdb
+splits_json: /flashfs1/work/btdai/PermCycXMol/lmdb_hot/splits_v1.json
+
+model:
+  load_pretrained: true
+  atom_phys_dim: 14
+  conf_dim: 256
+  shield_hidden_dim: 128
+  trunk_dim: 256
+  g_dim: 256
+  cham_hidden_dim: 128
+  assay_emb_dim: 32
+  max_sources: 256
+  use_cham_in_trunk: true
+  phys_dropout_prob: 0.25
+  use_grad_checkpoint: true
+  max_graphs_per_chunk: 16
+  max_edges_per_chunk: 24576
+
+train:
+  seed: 2026
+  epochs: 22
+  patience: 6
+  batch_size: 8
+  grad_accum: 3
+  chunk_size: 4
+  num_workers: 4
+  use_amp: true
+  amp_dtype: auto
+  k_confs_train: 8
+  k_confs_eval: 8
+  trunk_lr: 2.0e-5
+  head_lr: 3.0e-4
+  weight_decay: 1.0e-4
+  clip_grad_norm: 1.0
+  warmup_epochs: 2
+  lambda_abs: 1.0
+  lambda_delta: 1.0
+  lambda_cham: 0.3
+  lambda_cons: 0.25
+  lambda_aux_assay: 0.2
+  lambda_source_l2: 1.0e-3
+  smooth_l1_beta: 0.5

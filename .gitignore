@@ -1,0 +1,30 @@
+# macOS metadata
+.DS_Store
+._*
+
+# Python / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Checkpoints, databases & runtime outputs
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.lmdb
+*.mdb
+*.mdb-lock
+outputs*/
+logs/
+wandb/
+lightning_logs/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
